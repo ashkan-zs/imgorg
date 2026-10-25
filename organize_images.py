@@ -1,11 +1,12 @@
 """ Organized images and find duplicate file """
 import argparse
+import errno
+import hashlib
 import logging as log
 import os
 import shutil
 import time
 from datetime import datetime
-import hashlib
 
 
 log.getLogger().setLevel(log.INFO)
@@ -80,11 +81,6 @@ def should_organized(file_name):
     return False
 
 
-def convert_date(timestamp, format_date):
-    date = datetime.utcfromtimestamp(timestamp).strftime(format_date)
-    return date
-
-
 def check_duplicate_file(file_path):
     if os.path.isfile(file_path):
         with open(file_path, 'rb') as f:
@@ -114,7 +110,48 @@ def move_to_duplicate_folder(path, date):
     duplicate_path = os.path.join(duplicate_dir, date)
     if not os.path.isdir(duplicate_path):
         os.makedirs(duplicate_path)
-    shutil.move(path, duplicate_path)
+    move_without_overwriting(path, duplicate_path)
+
+
+def move_without_overwriting(source, destination_dir):
+    name = os.path.basename(source)
+    stem, extension = os.path.splitext(name)
+    suffix = 0
+
+    while True:
+        candidate_name = name if suffix == 0 else f'{stem}_{suffix}{extension}'
+        destination = os.path.join(destination_dir, candidate_name)
+        try:
+            # A hard link creates the destination only if it does not exist.
+            os.link(source, destination, follow_symlinks=False)
+        except FileExistsError:
+            suffix += 1
+            continue
+        except OSError as err:
+            if err.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
+                raise
+            try:
+                if os.path.islink(source):
+                    os.symlink(os.readlink(source), destination)
+                else:
+                    with open(source, 'rb') as source_file:
+                        with open(destination, 'xb') as destination_file:
+                            shutil.copyfileobj(source_file, destination_file)
+                    shutil.copystat(source, destination)
+            except FileExistsError:
+                suffix += 1
+                continue
+            except Exception:
+                if os.path.lexists(destination):
+                    os.unlink(destination)
+                raise
+
+        try:
+            os.unlink(source)
+        except Exception:
+            os.unlink(destination)
+            raise
+        return destination
 
 
 def file_dates(path):
@@ -140,13 +177,7 @@ def file_dates(path):
                         continue
 
                     if not check_duplicate_file(file_path):
-                        if not os.path.exists(moved_path):
-                            shutil.move(file_path, new_path)
-                        else:
-                            shutil.move(file_path, os.path.join(new_path,
-                                    convert_date(os.path.getctime(file_path),
-                                                 '%Y-%m-%d') +
-                                               os.path.splitext(file_path)[1]))
+                        move_without_overwriting(file_path, new_path)
                     else:
                         move_to_duplicate_folder(file_path, image_date)
 
@@ -159,7 +190,7 @@ def file_dates(path):
                     if file_path == exist_path:
                         continue
                     if not check_duplicate_file(file_path):
-                        shutil.move(file_path, need_review_dir)
+                        move_without_overwriting(file_path, need_review_dir)
                     else:
                         move_to_duplicate_folder(file_path, image_date)
                 except Exception:
