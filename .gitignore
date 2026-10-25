@@ -3,6 +3,7 @@ imgs/
 needs-review/
 duplicate-files/
 organized-images/
+.sha256_hashes.txt
 
 ## Code ##
 .vscode/*

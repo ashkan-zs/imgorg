@@ -46,13 +46,13 @@ need_review_dir = os.path.join(path, need_review)
 ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate ]
 ignore_files = ['.gitignore']
 
-# File for saveing hashes
-data_file = os.path.join(path, '.hash_data.txt')
-hash_keys = []
+# File for saving hashes
+data_file = os.path.join(path, '.sha256_hashes.txt')
+hash_keys = set()
 
 if not os.path.isdir(need_review_dir):
     os.mkdir(need_review_dir)
-    log.info("need_rewiew directory created.")
+    log.info("need_review directory created.")
 
 
 if not os.path.isdir(duplicate_dir):
@@ -63,14 +63,21 @@ if not os.path.isdir(duplicate_dir):
 def load_hash_file():
     try:
         with open(data_file, 'r') as file:
-            hash_keys.append(file.read().split())
+            for line in file:
+                file_hash = line.strip()
+
+                # SHA-256 hashes have 64 hex characters
+                if len(file_hash) == 64:
+                    hash_keys.add(file_hash)
+
     except IOError:
         pass
 
 
 def save_hash_file():
     with open(data_file, 'w') as file:
-        file.writelines('%s\n' % hashes for hashes in hash_keys)
+        for file_hash in sorted(hash_keys):
+            file.write(f'{file_hash}\n')
 
 
 def should_organized(file_name):
@@ -81,21 +88,27 @@ def should_organized(file_name):
     return False
 
 
+def calculate_hash(file_path):
+    sha256 = hashlib.sha256()
+
+    with open(data_file, 'rb') as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b''):
+            sha256.update(chunk)
+
+        return sha256.hexdigest()
+
+
 def check_duplicate_file(file_path):
-    if os.path.isfile(file_path):
-        with open(file_path, 'rb') as f:
-            file_hash = hashlib.sha1(f.read()).hexdigest()
-        if file_hash not in hash_keys:
-            hash_keys.append(file_hash)
-            return False
+    if not os.path.isfile(file_path):
+        return False
+
+    file_hash = calculate_hash(file_path)
+
+    if file_hash in hash_keys:
         return True
 
-    # if os.path.exists(des_path) and src_path != des_path:
-    #     if get_image_date(src_path) == get_image_date(des_path):
-    #         return True
-    #     else:
-    #         return False
-    # return False
+    hash_keys.add(file_hash)
+    return False
 
 
 def get_image_date(path):
