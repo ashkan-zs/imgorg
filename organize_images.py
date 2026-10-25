@@ -11,17 +11,7 @@ from datetime import datetime
 
 
 log.getLogger().setLevel(log.INFO)
-parser = argparse.ArgumentParser(
-    description='This is a script for organizing photos by date')
-parser.add_argument(
-    '-s',
-    '--src',
-    help='the directory you want to organize',
-    nargs='?',
-    default=os.getcwd())
-args = parser.parse_args()
 
-path = args.src
 
 # Organized extensions
 organized_extensions = ['heic', 'jpg', 'jpeg', 'png', 'gif', 'tiff', 'tif', 'cr2', 'psd', 'mov', 'mp4']
@@ -40,26 +30,12 @@ organized_images = 'organized-images'
 need_review = 'needs-review'
 duplicate = 'duplicate-files'
 
-duplicate_dir = os.path.join(path, duplicate)
-need_review_dir = os.path.join(path, need_review)
-
 # Ignored files and folders
 ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate ]
 ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
 # File for saving hashes
-data_file = os.path.join(path, '.sha256_hashes.txt')
 hash_keys = set()
-
-if not os.path.isdir(need_review_dir):
-    os.mkdir(need_review_dir)
-    log.info("need_review directory created.")
-
-
-if not os.path.isdir(duplicate_dir):
-    os.mkdir(duplicate_dir)
-    log.info("duplicate_dir directory created.")
-
 
 def load_hash_file():
     try:
@@ -198,5 +174,34 @@ def file_dates(path):
                 log.error("Failed to process %s: %s", file_path, err)
 
 
-file_dates(path)
-save_hash_file()
+def main():
+    global path, duplicate_dir, need_review_dir, data_file
+
+    parser = argparse.ArgumentParser(
+        description='This is a script for organizing photos by date'
+    )
+    parser.add_argument(
+        '-s',
+        '--src',
+        help='the directory you want to organize',
+        nargs='?',
+        default=os.getcwd()
+    )
+    
+    args = parser.parse_args()
+
+    path = args.src
+
+    duplicate_dir = os.path.join(path, duplicate)
+    need_review_dir = os.path.join(path, need_review)
+    data_file = os.path.join(path, '.sha256_hashes.txt')
+
+    os.makedirs(duplicate_dir, exist_ok=True)
+    os.makedirs(need_review_dir, exist_ok=True)
+
+    file_dates(path)
+    save_hash_file()
+
+
+if __name__ == "__main__":
+    main()
