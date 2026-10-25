@@ -125,8 +125,11 @@ def move_without_overwriting(source, destination_dir):
 
         try:
             os.unlink(source)
-        except Exception:
-            os.unlink(destination)
+        except OSError:
+            try:
+                os.unlink(destination)
+            except OSError:
+                log.exception("Failed to roll back destination: %s", destination)
             raise
         return destination
 
@@ -151,6 +154,7 @@ def file_dates(path):
             directory
             for directory in dirs
             if directory not in ignore_dirs
+            and not os.path.islink(os.path.join(root, directory))
         ]
 
         for filename in files:
@@ -158,6 +162,10 @@ def file_dates(path):
                 continue
 
             file_path = os.path.join(root, filename)
+
+            if os.path.islink(file_path):
+                log.warning("Skipping symbolic link: %s", file_path)
+                continue
 
             try:
                 image_date = get_image_date(file_path)
@@ -187,10 +195,13 @@ def main():
         nargs='?',
         default=os.getcwd()
     )
-    
+
     args = parser.parse_args()
 
-    path = args.src
+    path = os.path.abspath(args.src)
+
+    if not os.path.isdir(path):
+        parser.error(f"Source directory does not exist: {path}")
 
     duplicate_dir = os.path.join(path, duplicate)
     need_review_dir = os.path.join(path, need_review)
