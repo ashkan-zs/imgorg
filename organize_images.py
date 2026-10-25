@@ -44,7 +44,7 @@ need_review_dir = os.path.join(path, need_review)
 
 # Ignored extensions
 ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate ]
-ignore_files = ['.gitignore']
+ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
 # File for saving hashes
 data_file = os.path.join(path, '.sha256_hashes.txt')
@@ -91,7 +91,7 @@ def should_organized(file_name):
 def calculate_hash(file_path):
     sha256 = hashlib.sha256()
 
-    with open(data_file, 'rb') as file:
+    with open(file_path, 'rb') as file:
         for chunk in iter(lambda: file.read(1024 * 1024), b''):
             sha256.update(chunk)
 
@@ -169,12 +169,18 @@ def move_without_overwriting(source, destination_dir):
 
 def file_dates(path):
     load_hash_file()
+
     for root, dirs, files in os.walk(path):
-        if any(e in root.split('/') for e in ignore_dirs) or \
-                any(f in files for f in ignore_files):
-            continue
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory not in ignore_dirs
+        ]
 
         for filename in files:
+            if filename in ignore_files:
+                continue
+
             file_path = os.path.join(root, filename)
             image_date = get_image_date(file_path)
             if should_organized(filename):
