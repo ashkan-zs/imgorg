@@ -1,4 +1,5 @@
-""" Organized images and find duplicate file """
+"""Organized files by date and detect exact duplicate file using SHA-256."""
+
 import argparse
 import errno
 import hashlib
@@ -42,7 +43,7 @@ duplicate = 'duplicate-files'
 duplicate_dir = os.path.join(path, duplicate)
 need_review_dir = os.path.join(path, need_review)
 
-# Ignored extensions
+# Ignored files and folders
 ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate ]
 ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
@@ -96,19 +97,6 @@ def calculate_hash(file_path):
             sha256.update(chunk)
 
         return sha256.hexdigest()
-
-
-def check_duplicate_file(file_path):
-    if not os.path.isfile(file_path):
-        return False
-
-    file_hash = calculate_hash(file_path)
-
-    if file_hash in hash_keys:
-        return True
-
-    hash_keys.add(file_hash)
-    return False
 
 
 def get_image_date(path):
@@ -167,6 +155,18 @@ def move_without_overwriting(source, destination_dir):
         return destination
 
 
+def process_file(file_path, destination_dir, file_date):
+    file_hash = calculate_hash(file_path)
+
+    if file_hash in hash_keys:
+        move_to_duplicate_folder(file_path, file_date)
+        return
+
+    os.makedirs(destination_dir, exist_ok=True)
+    move_without_overwriting(file_path, destination_dir)
+    hash_keys.add(file_hash)
+
+
 def file_dates(path):
     load_hash_file()
 
@@ -182,38 +182,20 @@ def file_dates(path):
                 continue
 
             file_path = os.path.join(root, filename)
-            image_date = get_image_date(file_path)
-            if should_organized(filename):
-                try:
-                    new_path = os.path.join(path, organized_images, image_date)
 
-                    if not os.path.isdir(new_path):
-                        os.makedirs(new_path)
+            try:
+                image_date = get_image_date(file_path)
 
-                    moved_path = os.path.join(new_path, filename)
+                if should_organized(filename):
+                    destination_dir = os.path.join(path, organized_images, image_date)
 
-                    if file_path == moved_path:
-                        continue
+                else:
+                    destination_dir = need_review_dir
 
-                    if not check_duplicate_file(file_path):
-                        move_without_overwriting(file_path, new_path)
-                    else:
-                        move_to_duplicate_folder(file_path, image_date)
+                process_file(file_path, destination_dir, image_date)
 
-                except Exception as err:
-                    print(err)
-
-            else:
-                try:
-                    exist_path = os.path.join(need_review_dir, filename)
-                    if file_path == exist_path:
-                        continue
-                    if not check_duplicate_file(file_path):
-                        move_without_overwriting(file_path, need_review_dir)
-                    else:
-                        move_to_duplicate_folder(file_path, image_date)
-                except Exception:
-                    pass
+            except Exception as err:
+                log.error("Failed to process %s: %s", file_path, err)
 
 
 file_dates(path)
