@@ -134,30 +134,48 @@ def move_without_overwriting(source, destination_dir):
         return destination
 
 
-def process_file(file_path, destination_dir, file_date, dry_run=False):
+def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False):
+    if stats is None:
+        stats = {
+            "organized": 0,
+            "review": 0,
+            "duplicates": 0,
+            "errors": 0,
+        }
+
     file_hash = calculate_hash(file_path)
 
     if file_hash in hash_keys:
         if dry_run:
             log.info("[DRY RUN] DUPLICATE: %s -> %s",
                      file_path, os.path.join(duplicate_dir, file_date))
-            return
+        else:
+            move_to_duplicate_folder(file_path, file_date)
 
-        move_to_duplicate_folder(file_path, file_date)
+        stats['duplicate'] += 1
         return
 
     if dry_run:
         log.info("[DRY RUN] MOVE: %s -> %s", file_path, destination_dir)
-        hash_keys.add(file_hash)
-        return
+    else:
+        os.makedirs(destination_dir, exist_ok=True)
+        move_without_overwriting(file_path, destination_dir)
 
-    os.makedirs(destination_dir, exist_ok=True)
-    move_without_overwriting(file_path, destination_dir)
     hash_keys.add(file_hash)
+
+    if category is not None:
+        stats[category] += 1
 
 
 def file_dates(path, dry_run=False):
     load_hash_file()
+
+    stats = {
+        "organized": 0,
+        "review": 0,
+        "duplicates": 0,
+        "errors": 0,
+    }
 
     for root, dirs, files in os.walk(path):
         dirs[:] = [
@@ -182,14 +200,29 @@ def file_dates(path, dry_run=False):
 
                 if should_organized(filename):
                     destination_dir = os.path.join(path, organized_images, image_date)
-
+                    category = "organized"
                 else:
                     destination_dir = need_review_dir
+                    category = "review"
 
-                process_file(file_path, destination_dir, image_date, dry_run)
+                process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run)
 
             except Exception as err:
+                stats["errors"] += 1
                 log.error("Failed to process %s: %s", file_path, err)
+
+    return stats
+
+
+def print_summary(stats, dry_run=False):
+    title = "Dry Run Summary" if dry_run else "Summary"
+
+    print(f"\n--- {title} ---")
+    print(f"Organized:    {stats['organized']}")
+    print(f"Needs review: {stats['review']}")
+    print(f"Duplicates:   {stats['duplicates']}")
+    print(f"Errors:       {stats['errors']}")
+    print(f"Total:        {sum(stats.values())}")
 
 
 def main():
@@ -226,10 +259,12 @@ def main():
         os.makedirs(duplicate_dir, exist_ok=True)
         os.makedirs(need_review_dir, exist_ok=True)
 
-    file_dates(path, dry_run=args.dry_run)
+    stats = file_dates(path, dry_run=args.dry_run)
 
     if not args.dry_run:
         save_hash_file()
+
+    print_summary(stats, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":
