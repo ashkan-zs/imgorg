@@ -12,6 +12,8 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
+from path_utils import path_is_within, same_path
+
 
 register_heif_opener()
 
@@ -119,8 +121,7 @@ def get_image_date(file_path):
 
 
 def validate_destination_path(destination, root):
-    root = os.path.realpath(root)
-    if os.path.commonpath([os.path.realpath(destination), root]) != root:
+    if not path_is_within(destination, root):
         raise OSError(f'Destination escapes generated output directory: {destination}')
 
 
@@ -229,7 +230,7 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None):
             for directory in dirs
             if directory not in ignore_dirs
             and not os.path.islink(os.path.join(root, directory))
-            and os.path.realpath(os.path.join(root, directory)) != output
+            and not same_path(os.path.join(root, directory), output)
         )
 
         for filename in sorted(files):
@@ -293,7 +294,7 @@ def validate_output_path(source, output, directories, check_database=True):
             raise ValueError(f'Generated output directory is a symbolic link: {destination}')
         if os.path.lexists(destination) and not os.path.isdir(destination):
             raise ValueError(f'Generated output path is not a directory: {destination}')
-        if os.path.commonpath([source, destination]) == destination:
+        if path_is_within(source, destination):
             raise ValueError(f'Source must not be inside a generated output directory: {destination}')
 
     database = os.path.join(output, '.sha256_hashes.txt')
@@ -378,7 +379,7 @@ def main():
 
     if args.find_similar_only:
         run_similarity(
-            scan_images(path, excluded_dirs=[output] if output != path else []),
+            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else []),
             path, args.similar_threshold, dry_run=args.dry_run,
             output=output if args.output is not None else None
         )

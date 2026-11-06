@@ -13,6 +13,8 @@ from urllib.parse import quote
 import imagehash
 from PIL import Image, ImageOps
 
+from path_utils import same_path
+
 
 REPORT_DIRECTORY = 'similar-images'
 SCAN_IGNORE_DIRS = {REPORT_DIRECTORY, '.git', '.venv', '__pycache__', '.pytest_cache'}
@@ -25,13 +27,13 @@ def scan_images(source, excluded_dirs=()):
     def scan_error(err):
         log.warning('[SIMILARITY] Cannot scan directory: %s', err)
 
-    excluded = {os.path.realpath(directory) for directory in excluded_dirs}
+    excluded = tuple(excluded_dirs)
     for root, dirs, files in os.walk(source, onerror=scan_error):
         dirs[:] = sorted(
             name for name in dirs
             if name not in SCAN_IGNORE_DIRS
             and not os.path.islink(os.path.join(root, name))
-            and os.path.realpath(os.path.join(root, name)) not in excluded
+            and not any(same_path(os.path.join(root, name), directory) for directory in excluded)
         )
         for name in sorted(files):
             path = os.path.join(root, name)
