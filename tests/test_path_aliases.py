@@ -215,3 +215,20 @@ def test_destination_containment_rejects_a_symlink_escape(tmp_path):
     assert not path_is_within(root / 'escape' / 'new', root)
     with pytest.raises(OSError, match='Destination escapes'):
         organize_images.validate_destination_path(root / 'escape' / 'new', root)
+
+
+def test_copy_records_output_root_case_alias(tmp_path, case_insensitive):
+    source = tmp_path / 'photos'
+    source.mkdir()
+    record = source / '.copy_records.json'
+    record.write_text('{}')
+    nested = source / 'nested' / '.copy_records.json'
+    nested.parent.mkdir()
+    nested.write_text('user content')
+    alias = tmp_path / 'PHOTOS'
+    candidates = list(similarity.scan_images(source, output=alias))
+    assert [Path(item['path']) for item in candidates] == [nested]
+    result = run_cli(source, alias)
+    assert result.returncode == 0, result.stderr
+    assert record.read_text() == '{}'
+    assert (source / 'needs-review' / '.copy_records.json').read_text() == 'user content'

@@ -44,7 +44,7 @@ similar = 'similar-images'
 
 # Ignored files and folders
 ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate, similar ]
-ignore_files = ['.gitignore', '.sha256_hashes.txt', '.copy_records.json']
+ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
 # File for saving hashes
 hash_keys = set()
@@ -381,7 +381,8 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
         for filename in sorted(files):
             if filename in ignore_files or (
                 same_path(root, output)
-                and is_staging_name(filename, ('.copy-records-', '.hashes-'))
+                and (same_path(os.path.join(root, filename), os.path.join(output, '.copy_records.json'))
+                     or is_staging_name(filename, ('.copy-records-', '.hashes-')))
             ):
                 continue
 
@@ -531,7 +532,7 @@ def main():
 
     if args.find_similar_only:
         run_similarity(
-            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else []),
+            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else [], output=output),
             path, args.similar_threshold, dry_run=args.dry_run,
             output=output if args.output is not None else None
         )

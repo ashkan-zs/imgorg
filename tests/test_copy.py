@@ -346,3 +346,33 @@ def test_recovery_restores_multiple_records_before_similarity(tmp_path):
     assert 'Images analyzed: 2' in result.stdout
     assert len(list((output / 'organized-images').rglob('*.jpg'))) == 2
     assert_report_links(output)
+
+
+@pytest.mark.parametrize('copy_mode', [False, True])
+def test_nested_copy_records_is_user_input(tmp_path, copy_mode):
+    import similarity
+    source = tmp_path / 'source'
+    output = source if not copy_mode else tmp_path / 'output'
+    nested = add_file(source / 'nested' / '.copy_records.json', b'user data')
+    assert nested in [Path(item['path']) for item in similarity.scan_images(source, output=output)]
+    args = ['--copy', '--output', output] if copy_mode else []
+    result = run_cli(source, *args)
+    assert 'Needs review: 1' in result.stdout
+    assert (output / 'needs-review' / '.copy_records.json').read_bytes() == b'user data'
+    assert nested.exists() == copy_mode
+    if copy_mode:
+        assert nested.read_bytes() == b'user data'
+        assert (output / '.copy_records.json').read_bytes() != b'user data'
+
+
+def test_output_root_records_excluded_but_unrelated_source_included(tmp_path):
+    import similarity
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    incoming = add_file(source / '.copy_records.json', b'user data')
+    records = add_file(output / '.copy_records.json', b'{}')
+    assert [Path(item['path']) for item in similarity.scan_images(source, output=output)] == [incoming]
+    assert list(similarity.scan_images(output, output=output)) == []
+    run_cli(source, '--output', output)
+    assert (output / 'needs-review' / '.copy_records.json').read_bytes() == b'user data'
+    assert records.read_bytes() == b'{}'
