@@ -20,6 +20,42 @@ the filesystem modification time.
 Run the script with `python organize_images.py --src /path/to/photos`.
 Add `--dry-run` to preview changes.
 
+### Output directory
+
+By default, outputs and `.sha256_hashes.txt` stay under `--src`, as before.
+Use `--output PATH` to choose a separate output root:
+
+```sh
+python organize_images.py --src ~/Pictures/Unsorted --output ~/Pictures/Sorted
+python organize_images.py --src ./photos --output ./sorted --dry-run
+```
+
+Organized files go into `OUTPUT/organized-images/`, exact duplicates into
+`OUTPUT/duplicate-files/`, and other files into `OUTPUT/needs-review/`.
+`OUTPUT/similar-images/` is created only when a similarity mode is requested.
+Files are moved using the existing collision-safe transfers; `--output` does
+not enable copying. Relative paths are resolved against the working directory;
+`~`, `..`, and directory aliases are normalized.
+
+The hash database lives at `OUTPUT/.sha256_hashes.txt`, so repeat runs and
+different sources targeting the same output share that library's duplicate
+history. A database at a different source location is left untouched and is
+not automatically migrated or merged. Keep using the same output root to retain
+its history. Similarity-only mode neither reads nor writes either database.
+
+Output may equal the source, be outside it, or be nested inside it. A distinct
+output subtree inside the source is excluded entirely from input scanning,
+including pre-existing files there. Normal organization also continues to skip
+the standard generated directory names anywhere in the source. Sources located
+inside one of the configured generated destinations are rejected, as are
+symlinks or files occupying generated directory paths. Choose a different
+output root for those cases. Symbolic-link hash databases are also rejected.
+Date folders cannot redirect transfers outside their generated directory.
+Invalid paths and startup permission failures are reported without a traceback.
+The run is not transactional: a later transfer or database-save failure does
+not undo earlier successful moves. Dry-run creates no output directories,
+reports, or persistent files.
+
 ### Similarity detection
 
 Similarity detection is disabled by default. Organize new photos and then
@@ -27,6 +63,7 @@ analyze the successfully processed images:
 
 ```sh
 python organize_images.py --src ./photos --find-similar
+python organize_images.py --src ./photos --output ./sorted --find-similar
 ```
 
 Scan an existing archive recursively without running file organization:
@@ -35,6 +72,7 @@ Scan an existing archive recursively without running file organization:
 python organize_images.py --src ./organized-images --find-similar-only
 python organize_images.py --src ./organized-images --find-similar-only --similar-threshold 5
 python organize_images.py --src ./organized-images --find-similar-only --dry-run
+python organize_images.py --src ./organized-images --output ./reports --find-similar-only
 ```
 
 `--find-similar-only` takes precedence if both similarity flags are provided.
@@ -44,6 +82,10 @@ It writes only the two similarity reports. Files inside existing `similar-images
 directories, development/cache directories, hash databases, and report artifacts
 are excluded; symbolic links are not followed. Image-containing folders such as
 `organized-images`, `duplicate-files`, and `needs-review` are included in this mode.
+With `--output`, only the report destination changes; the archive images stay
+in place. A distinct report-output subtree nested inside the archive is excluded
+from the scan. With both `--output` and `--dry-run`, neither similarity mode
+creates the output path, and previews use the original source paths.
 
 To preview combined organization and similarity analysis without any writes:
 
@@ -97,7 +139,7 @@ comparisons and keeps hashes in memory; large archives may take time. Highest
 resolution is only a heuristic and does not identify an original or the
 best-quality image.
 
-Reports are written under the directory passed to `--src`:
+Reports are written under `--output`, or under `--src` when `--output` is omitted:
 
 - `similar-images/report.json`: UTC generation timestamp, algorithm, hash size,
   threshold, counts, references, member paths, original filenames, dimensions,
@@ -106,9 +148,12 @@ Reports are written under the directory passed to `--src`:
   reference labels, filenames, dimensions, and distances. No server, JavaScript,
   CDN, or internet connection is required.
 
-JSON image paths are relative to `--src` and use forward slashes. HTML links are
-URL-encoded relative to the report directory (`../` followed by that image path).
-Keep the reports and image tree together for links to work. Previews reference
+JSON image paths use forward slashes and are relative to the output root when
+`--output` is supplied, or to `--src` otherwise. The `path_base` field identifies
+the convention. In similarity-only mode, paths can contain `..` to reach source
+images outside the report-output root. HTML links are URL-encoded relative to
+the report directory (`../` followed by that image path). Preserve the relative
+locations of reports and images for links to work. Previews reference
 existing images without copying or embedding them. Browsers without HEIC/HEIF
 (or other format) support show fallback text and an original-file link for use
 with a compatible viewer. No generated thumbnails are stored.
