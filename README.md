@@ -20,6 +20,56 @@ the filesystem modification time.
 Run the script with `python organize_images.py --src /path/to/photos`.
 Add `--dry-run` to preview changes.
 
+### Copy mode
+
+Files are moved by default. Use `--copy` to preserve originals:
+
+```sh
+python organize_images.py --src ./photos --copy
+python organize_images.py --src ./photos --output ./sorted --copy
+python organize_images.py --src ./photos --output ./sorted --copy --find-similar
+python organize_images.py --src ./photos --output ./sorted --copy --find-similar --dry-run
+```
+
+Copy mode uses the same organization layout, SHA-256 classification, and collision
+suffixes. Source contents and modification times remain unchanged; `copy2` preserves
+metadata supported by the filesystem. Source symlinks are skipped. Reads can update
+filesystem access times. Copies are staged in the destination directory and published
+with an exclusive hard link only when complete and verified. The published file is
+independent of the source. If hard links are unavailable, Linux and macOS use native
+exclusive rename (never an existence check followed by an overwriting rename).
+Support depends on the filesystem/driver, including exFAT and network mounts; if
+neither primitive is supported, copying fails safely. Temporary files are removed
+on ordinary failures.
+
+`OUTPUT/.copy_records.json` records copy intents before publication by resolved absolute
+source path, SHA-256, destination, category, and staged filesystem identity. Only an
+existing destination with matching identity and contents counts as completed. An
+unchanged source with a verified existing copy
+is reused on subsequent runs. A different source path with identical content is still
+copied into `duplicate-files`. Different content at an existing destination name is
+preserved and a numbered filename is selected. Changed sources or missing/modified
+recorded destinations are processed again using the current SHA-256 database. Renaming
+a source makes it a new source path. Keep the copy records with the output library.
+
+Summary counts classify processed source files, including reused copies; `ALREADY
+COPIED` messages identify reuse. New hashes are recorded only after successful copying
+and record persistence. Dry-run simulates this in memory, prints `COPY` and `DUPLICATE
+COPY` operations, and writes neither database nor reports. Combined similarity mode
+uses successful or reused nonduplicate destinations; dry-run uses original paths.
+`--copy --find-similar-only` is rejected because archive-only scanning is read-only.
+
+Run only one organizer against an output library at a time. Copy records and the hash
+database are atomically replaced individually, not as one transaction. After process
+termination, a published copy can be recognized from its intent and the hash database
+repaired on the next non-dry run. Unpublished intents are retried without adopting
+unrelated files. Leftover staging files are excluded from organization and archive
+similarity scans (reserved prefixes `.copy-`, `.copy-records-`, `.hashes-`); they are not
+automatically deleted. This is process-interruption recovery, not a power-loss durability
+guarantee. Remounts that change filesystem identities, lost records, and copies made
+before intent recording was introduced may require a new copy; content equality alone
+cannot prove provenance. Originals are retained.
+
 ### Output directory
 
 By default, outputs and `.sha256_hashes.txt` stay under `--src`, as before.
@@ -159,9 +209,9 @@ existing images without copying or embedding them. Browsers without HEIC/HEIF
 with a compatible viewer. No generated thumbnails are stored.
 
 Similarity analysis never deletes, moves, renames, overwrites, or edits images.
-Combined mode still performs the normal organization moves requested by the CLI;
+Combined mode performs the requested organization transfers (moves or copies);
 it records actual destination paths, including collision suffixes, only after a
-successful move. Existing generated directories are not rescanned in combined
+successful transfer. Existing generated directories are not rescanned in combined
 mode. Similarity-only mode leaves source files, timestamps, metadata, and the hash
 database untouched. Reading files may update access times according to the
 filesystem. Existing reports are replaced on each non-dry run, including when no

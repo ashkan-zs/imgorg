@@ -18,7 +18,7 @@ from path_utils import same_path
 
 REPORT_DIRECTORY = 'similar-images'
 SCAN_IGNORE_DIRS = {REPORT_DIRECTORY, '.git', '.venv', '__pycache__', '.pytest_cache'}
-SCAN_IGNORE_FILES = {'.sha256_hashes.txt', 'report.json', 'report.html', '.DS_Store'}
+SCAN_IGNORE_FILES = {'.copy_records.json', '.sha256_hashes.txt', 'report.json', 'report.html', '.DS_Store'}
 VIDEO_EXTENSIONS = {'.mov', '.mp4', '.m4v', '.avi', '.mkv', '.webm', '.mpeg', '.mpg', '.3gp'}
 
 
@@ -37,7 +37,9 @@ def scan_images(source, excluded_dirs=()):
         )
         for name in sorted(files):
             path = os.path.join(root, name)
-            if name not in SCAN_IGNORE_FILES and not os.path.islink(path):
+            if (name not in SCAN_IGNORE_FILES
+                    and not name.startswith(('.copy-', '.copy-records-', '.hashes-'))
+                    and not os.path.islink(path)):
                 yield {'path': path, 'original_name': name}
 
 
