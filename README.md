@@ -125,9 +125,19 @@ single run, not a persistent index, and later external changes can invalidate li
 
 ### Tests
 
-To run the tests:
+GitHub Actions runs the full test suite on Ubuntu with Python 3.11, 3.12, 3.13,
+3.14, and 3.15 on pushes to `main`, pull requests targeting `main`, and manual
+runs. All five versions are required CI jobs. Python 3.15 has stable Linux builds
+in `actions/setup-python` and compatible dependency wheels; it needs no prerelease
+opt-in. Each job installs the declared dependencies, runs `pip check`, and executes
+all tests, including HEIC/HEIF tests.
+
+To run the same checks locally, activate your virtual environment first:
 
 ```sh
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python -m pip install pytest
+python -m pip check
 python -m pytest -v
 ```
