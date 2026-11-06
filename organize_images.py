@@ -34,9 +34,10 @@ dir_format = '%Y/%B'
 organized_images = 'organized-images'
 need_review = 'needs-review'
 duplicate = 'duplicate-files'
+similar = 'similar-images'
 
 # Ignored files and folders
-ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate ]
+ignore_dirs = ['.git', '.venv', organized_images, need_review, duplicate, similar ]
 ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
 # File for saving hashes
@@ -186,22 +187,25 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
         else:
             move_to_duplicate_folder(file_path, file_date)
 
-        stats['duplicate'] += 1
+        stats['duplicates'] += 1
         return
 
     if dry_run:
         log.info("[DRY RUN] MOVE: %s -> %s", file_path, destination_dir)
+        destination = file_path
     else:
         os.makedirs(destination_dir, exist_ok=True)
-        move_without_overwriting(file_path, destination_dir)
+        destination = move_without_overwriting(file_path, destination_dir)
 
     hash_keys.add(file_hash)
 
     if category is not None:
         stats[category] += 1
 
+    return destination
 
-def file_dates(path, dry_run=False):
+
+def file_dates(path, dry_run=False, similarity_paths=None):
     load_hash_file()
 
     stats = {
@@ -212,14 +216,14 @@ def file_dates(path, dry_run=False):
     }
 
     for root, dirs, files in os.walk(path):
-        dirs[:] = [
+        dirs[:] = sorted(
             directory
             for directory in dirs
             if directory not in ignore_dirs
             and not os.path.islink(os.path.join(root, directory))
-        ]
+        )
 
-        for filename in files:
+        for filename in sorted(files):
             if filename in ignore_files:
                 continue
 
@@ -239,7 +243,12 @@ def file_dates(path, dry_run=False):
                     destination_dir = need_review_dir
                     category = "review"
 
-                process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run)
+                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run)
+                if similarity_paths is not None and destination is not None:
+                    similarity_paths.append({
+                        'path': destination,
+                        'original_name': filename,
+                    })
 
             except Exception as err:
                 stats["errors"] += 1
@@ -277,13 +286,47 @@ def main():
         action='store_true',
         help='Preview file operations without making changes'
     )
+    parser.add_argument(
+        '--find-similar',
+        action='store_true',
+        help='Report perceptually similar images without acting on matches'
+    )
+    parser.add_argument(
+        '--find-similar-only',
+        action='store_true',
+        help='Scan an existing archive without organizing or relocating files'
+    )
+    parser.add_argument(
+        '--similar-threshold',
+        type=int,
+        default=5,
+        help='Maximum 64-bit pHash Hamming distance, from 0 to 64 (default: 5)'
+    )
 
     args = parser.parse_args()
+
+    if not 0 <= args.similar_threshold <= 64:
+        parser.error('--similar-threshold must be between 0 and 64')
 
     path = os.path.abspath(args.src)
 
     if not os.path.isdir(path):
         parser.error(f"Source directory does not exist: {path}")
+
+    if args.find_similar or args.find_similar_only:
+        try:
+            from similarity import run_similarity, scan_images
+        except ImportError as err:
+            parser.error(
+                f'Similarity dependencies unavailable ({err}); '
+                'install them with python -m pip install -r requirements.txt'
+            )
+
+    if args.find_similar_only:
+        run_similarity(
+            scan_images(path), path, args.similar_threshold, dry_run=args.dry_run
+        )
+        return
 
     duplicate_dir = os.path.join(path, duplicate)
     need_review_dir = os.path.join(path, need_review)
@@ -293,12 +336,18 @@ def main():
         os.makedirs(duplicate_dir, exist_ok=True)
         os.makedirs(need_review_dir, exist_ok=True)
 
-    stats = file_dates(path, dry_run=args.dry_run)
+    similarity_paths = [] if args.find_similar else None
+    stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths)
 
     if not args.dry_run:
         save_hash_file()
 
     print_summary(stats, dry_run=args.dry_run)
+
+    if args.find_similar:
+        run_similarity(
+            similarity_paths, path, args.similar_threshold, dry_run=args.dry_run
+        )
 
 
 if __name__ == "__main__":
