@@ -16,7 +16,7 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
-from path_utils import path_is_within, same_path
+from path_utils import is_staging_name, path_is_within, same_path
 
 
 register_heif_opener()
@@ -379,7 +379,10 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
         )
 
         for filename in sorted(files):
-            if filename in ignore_files or filename.startswith(('.copy-', '.copy-records-', '.hashes-')):
+            if filename in ignore_files or (
+                same_path(root, output)
+                and is_staging_name(filename, ('.copy-records-', '.hashes-'))
+            ):
                 continue
 
             file_path = os.path.join(root, filename)

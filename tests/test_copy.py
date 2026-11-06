@@ -260,11 +260,38 @@ def test_interrupted_staging_artifacts_are_not_inputs(tmp_path):
     import similarity
     source = tmp_path / 'source'
     original = add_file(source / 'photo.jpg')
-    artifacts = [add_file(source / name) for name in ['.copy-abcd', '.copy-records-abcd', '.hashes-abcd']]
+    add_file(source / '.copy_records.json', b'{}')
+    artifacts = [add_file(source / name) for name in ['.copy-records-abcdefgh', '.hashes-abcdefgh']]
+    artifacts.append(add_file(source / 'organized-images' / '2024' / 'January' / '.copy-abcdefgh'))
     assert list(similarity.scan_images(str(source))) == [{'path': str(original), 'original_name': original.name}]
     result = run_cli(source, '--copy')
     assert 'Total:        1' in result.stdout
     assert all(path.exists() for path in artifacts)
+
+
+def test_prefixed_inputs_are_not_excluded(tmp_path):
+    import similarity
+    source = tmp_path / 'source'
+    first = add_file(source / '.copy-photo.jpg', b'first')
+    second = add_file(source / 'nested' / '.hashes-photo.jpg', b'second')
+    third = add_file(source / 'nested' / '.copy-records-abcdefgh', b'third')
+    assert {Path(item['path']) for item in similarity.scan_images(source)} == {first, second, third}
+    before = snapshot_files(source)
+    preview = run_cli(source, '--dry-run')
+    assert 'Total:        3' in preview.stdout
+    assert snapshot_files(source) == before
+    result = run_cli(source)
+    assert 'Total:        3' in result.stdout
+    assert not any(p.exists() for p in (first, second, third))
+    assert len(list((source / 'organized-images').rglob('*.jpg'))) == 2
+
+
+def test_similarity_only_finds_prefixed_image(tmp_path):
+    source = tmp_path / 'photos'
+    make_similar_photos(source)
+    (source / 'one' / 'photo.jpg').rename(source / 'one' / '.hashes-photo.jpg')
+    result = run_cli(source, '--find-similar-only', '--dry-run')
+    assert 'Images analyzed: 2' in result.stdout
 
 
 def test_recovery_hashes_are_loaded_before_new_sources(tmp_path):

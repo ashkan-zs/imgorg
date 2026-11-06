@@ -13,7 +13,7 @@ from urllib.parse import quote
 import imagehash
 from PIL import Image, ImageOps
 
-from path_utils import same_path
+from path_utils import is_staging_name, path_is_within, same_path
 
 
 REPORT_DIRECTORY = 'similar-images'
@@ -37,8 +37,28 @@ def scan_images(source, excluded_dirs=()):
         )
         for name in sorted(files):
             path = os.path.join(root, name)
+            ancestor = os.path.realpath(root)
+            staging = False
+            while True:
+                if (os.path.isfile(os.path.join(ancestor, '.copy_records.json'))
+                        or all(os.path.isdir(os.path.join(ancestor, directory))
+                               for directory in ('duplicate-files', 'needs-review'))):
+                    staging = (
+                        same_path(root, ancestor)
+                        and is_staging_name(name, ('.copy-records-', '.hashes-'))
+                    ) or (
+                        is_staging_name(name, ('.copy-',))
+                        and any(path_is_within(root, os.path.join(ancestor, directory))
+                                for directory in ('organized-images', 'duplicate-files', 'needs-review'))
+                    )
+                    if staging:
+                        break
+                parent = os.path.dirname(ancestor)
+                if parent == ancestor:
+                    break
+                ancestor = parent
             if (name not in SCAN_IGNORE_FILES
-                    and not name.startswith(('.copy-', '.copy-records-', '.hashes-'))
+                    and not staging
                     and not os.path.islink(path)):
                 yield {'path': path, 'original_name': name}
 

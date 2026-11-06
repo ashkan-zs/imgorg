@@ -64,7 +64,8 @@ database are atomically replaced individually, not as one transaction. After pro
 termination, a published copy can be recognized from its intent and the hash database
 repaired on the next non-dry run. Unpublished intents are retried without adopting
 unrelated files. Leftover staging files are excluded from organization and archive
-similarity scans (reserved prefixes `.copy-`, `.copy-records-`, `.hashes-`); they are not
+similarity scans in the corresponding output locations (temporary names use `.copy-`,
+`.copy-records-`, or `.hashes-` followed by eight random characters); they are not
 automatically deleted. This is process-interruption recovery, not a power-loss durability
 guarantee. Remounts that change filesystem identities, lost records, and copies made
 before intent recording was introduced may require a new copy; content equality alone
