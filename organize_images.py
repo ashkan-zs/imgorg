@@ -7,12 +7,16 @@ import logging as log
 import os
 import shutil
 import time
+import json
+import tempfile
+import ctypes
+import sys
 from datetime import datetime
 from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
-from path_utils import path_is_within, same_path
+from path_utils import is_staging_name, path_is_within, same_path
 
 
 register_heif_opener()
@@ -176,7 +180,110 @@ def move_without_overwriting(source, destination_dir):
         return destination
 
 
-def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False):
+def rename_without_overwriting(source, destination):
+    """Use a native exclusive rename; never emulate it with check-then-rename."""
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin' and hasattr(library, 'renamex_np'):
+        function = library.renamex_np
+        function.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (os.fsencode(source), os.fsencode(destination), 4)  # RENAME_EXCL
+    elif sys.platform.startswith('linux') and hasattr(library, 'renameat2'):
+        function = library.renameat2
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        arguments = (-100, os.fsencode(source), -100, os.fsencode(destination), 1)  # AT_FDCWD, RENAME_NOREPLACE
+    else:
+        raise OSError(errno.EOPNOTSUPP, 'Atomic exclusive rename unavailable')
+    function.restype = ctypes.c_int
+    if function(*arguments) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), destination)
+
+
+def copy_without_overwriting(source, destination_dir, expected_hash=None, before_publish=None):
+    if os.path.islink(source) or not os.path.isfile(source):
+        raise OSError(f'Copy source must be a regular file: {source}')
+    descriptor, temporary = tempfile.mkstemp(prefix='.copy-', dir=destination_dir)
+    os.close(descriptor)
+    try:
+        shutil.copy2(source, temporary)
+        if expected_hash is not None and calculate_hash(temporary) != expected_hash:
+            raise OSError('Source changed during copying')
+        stem, extension = os.path.splitext(os.path.basename(source))
+        suffix = 0
+        while True:
+            name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
+            destination = os.path.join(destination_dir, name)
+            if before_publish is not None:
+                before_publish(destination, os.stat(temporary))
+            try:
+                # Publish the completed temporary inode exclusively, never the source inode.
+                try:
+                    os.link(temporary, destination)
+                except OSError as err:
+                    if err.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                        raise
+                    rename_without_overwriting(temporary, destination)
+                return destination
+            except FileExistsError:
+                suffix += 1
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class CopyRecords:
+    def __init__(self, output):
+        self.output = output
+        self.path = os.path.join(output, '.copy_records.json')
+        try:
+            with open(self.path) as file:
+                self.records = json.load(file)
+            if not isinstance(self.records, dict):
+                raise ValueError('Copy records must be an object')
+        except FileNotFoundError:
+            self.records = {}
+
+    def previous(self, source, digest):
+        key = os.path.realpath(source)
+        record = self.records.get(key)
+        if not isinstance(record, dict) or record.get('hash') != digest:
+            return None
+        destination = os.path.join(self.output, record.get('destination', ''))
+        category = record.get('category')
+        roots = {'organized': organized_images, 'review': need_review, 'duplicates': duplicate}
+        if category not in roots or not path_is_within(destination, os.path.join(self.output, roots[category])):
+            return None
+        if os.path.islink(destination) or not os.path.isfile(destination) or same_path(source, destination):
+            return None
+        identity = record.get('identity')
+        status = os.stat(destination)
+        if identity is not None and identity != [status.st_dev, status.st_ino]:
+            return None
+        if calculate_hash(destination) != digest:
+            return None
+        return destination, category
+
+    def remember(self, source, digest, destination, category, identity=None):
+        records = dict(self.records)
+        records[os.path.realpath(source)] = {
+            'hash': digest, 'destination': os.path.relpath(destination, self.output),
+            'category': category,
+        }
+        if identity is not None:
+            records[os.path.realpath(source)]['identity'] = [identity.st_dev, identity.st_ino]
+        descriptor, temporary = tempfile.mkstemp(prefix='.copy-records-', dir=self.output)
+        try:
+            with os.fdopen(descriptor, 'w') as file:
+                json.dump(records, file, indent=2)
+                file.write('\n')
+            os.replace(temporary, self.path)
+            self.records = records
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+
+def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None):
     if stats is None:
         stats = {
             "organized": 0,
@@ -186,6 +293,34 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
         }
 
     file_hash = calculate_hash(file_path)
+
+    if copy_records is not None:
+        previous = copy_records.previous(file_path, file_hash)
+        if previous is not None:
+            destination, previous_category = previous
+            stats[previous_category] += 1
+            hash_keys.add(file_hash)
+            log.info('%sALREADY COPIED: %s -> %s', '[DRY RUN] ' if dry_run else '', file_path, destination)
+            return None if previous_category == 'duplicates' else (file_path if dry_run else destination)
+        duplicate_copy = file_hash in hash_keys
+        target = os.path.join(duplicate_dir, file_date) if duplicate_copy else destination_dir
+        if duplicate_copy:
+            validate_destination_path(target, duplicate_dir)
+        copy_category = 'duplicates' if duplicate_copy else category
+        if dry_run:
+            log.info('[DRY RUN] %sCOPY: %s -> %s', 'DUPLICATE ' if duplicate_copy else '', file_path, target)
+            destination = file_path
+        else:
+            os.makedirs(target, exist_ok=True)
+            destination = copy_without_overwriting(
+                file_path, target, expected_hash=file_hash,
+                before_publish=lambda destination, identity: copy_records.remember(
+                    file_path, file_hash, destination, copy_category, identity
+                )
+            )
+        hash_keys.add(file_hash)
+        stats[copy_category] += 1
+        return None if duplicate_copy else destination
 
     if file_hash in hash_keys:
         validate_destination_path(os.path.join(duplicate_dir, file_date), duplicate_dir)
@@ -213,8 +348,18 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     return destination
 
 
-def file_dates(path, dry_run=False, similarity_paths=None, output=None):
+def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None):
     load_hash_file()
+    if copy_records is not None:
+        for source, record in copy_records.records.items():
+            if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
+                continue
+            digest = record['hash']
+            try:
+                if copy_records.previous(source, digest) is not None:
+                    hash_keys.add(digest)
+            except (OSError, ValueError, TypeError) as err:
+                log.warning('Cannot verify copy record for %s: %s', source, err)
     output = os.path.realpath(output if output is not None else path)
 
     stats = {
@@ -234,7 +379,11 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None):
         )
 
         for filename in sorted(files):
-            if filename in ignore_files:
+            if filename in ignore_files or (
+                same_path(root, output)
+                and (same_path(os.path.join(root, filename), os.path.join(output, '.copy_records.json'))
+                     or is_staging_name(filename, ('.copy-records-', '.hashes-')))
+            ):
                 continue
 
             file_path = os.path.join(root, filename)
@@ -256,7 +405,7 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None):
                     category = "review"
 
                 validate_destination_path(destination_dir, destination_root)
-                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run)
+                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records)
                 if similarity_paths is not None and destination is not None:
                     similarity_paths.append({
                         'path': destination,
@@ -321,6 +470,7 @@ def main():
         metavar='PATH',
         help='Output root for organized files and reports (default: source directory)'
     )
+    parser.add_argument('--copy', action='store_true', help='Copy files and preserve originals')
     parser.add_argument(
         '--dry-run',
         action='store_true',
@@ -344,6 +494,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.copy and args.find_similar_only:
+        parser.error('--copy cannot be combined with --find-similar-only')
 
     if not 0 <= args.similar_threshold <= 64:
         parser.error('--similar-threshold must be between 0 and 64')
@@ -379,7 +532,7 @@ def main():
 
     if args.find_similar_only:
         run_similarity(
-            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else []),
+            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else [], output=output),
             path, args.similar_threshold, dry_run=args.dry_run,
             output=output if args.output is not None else None
         )
@@ -388,6 +541,13 @@ def main():
     duplicate_dir = os.path.join(output, duplicate)
     need_review_dir = os.path.join(output, need_review)
     data_file = os.path.join(output, '.sha256_hashes.txt')
+
+    copy_records = None
+    if args.copy:
+        try:
+            copy_records = CopyRecords(output)
+        except (OSError, ValueError) as err:
+            parser.error(f'Cannot read copy records: {err}')
 
     if not args.dry_run:
         try:
@@ -399,13 +559,23 @@ def main():
     hash_keys.clear()
     similarity_paths = [] if args.find_similar else None
     try:
-        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths, output=output)
+        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths, output=output, copy_records=copy_records)
     except OSError as err:
         parser.exit(1, f'error: Cannot read hash database: {err}\n')
 
     if not args.dry_run:
         try:
-            save_hash_file()
+            if args.copy:
+                descriptor, temporary = tempfile.mkstemp(prefix='.hashes-', dir=output)
+                try:
+                    with os.fdopen(descriptor, 'w') as file:
+                        file.writelines(f'{digest}\n' for digest in sorted(hash_keys))
+                    os.replace(temporary, data_file)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            else:
+                save_hash_file()
         except OSError as err:
             parser.exit(1, f'error: Cannot save hash database: {err}\n')
 

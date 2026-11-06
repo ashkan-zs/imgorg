@@ -1,6 +1,12 @@
 """Filesystem-aware path comparisons without creating missing directories."""
 
 import os
+import re
+
+
+def is_staging_name(name, prefixes):
+    """Match the complete names produced by tempfile.mkstemp."""
+    return any(re.fullmatch(re.escape(prefix) + r'[a-z0-9_]{8}', name) for prefix in prefixes)
 
 
 def same_path(first, second):

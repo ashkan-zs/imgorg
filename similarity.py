@@ -13,7 +13,7 @@ from urllib.parse import quote
 import imagehash
 from PIL import Image, ImageOps
 
-from path_utils import same_path
+from path_utils import is_staging_name, path_is_within, same_path
 
 
 REPORT_DIRECTORY = 'similar-images'
@@ -22,12 +22,13 @@ SCAN_IGNORE_FILES = {'.sha256_hashes.txt', 'report.json', 'report.html', '.DS_St
 VIDEO_EXTENSIONS = {'.mov', '.mp4', '.m4v', '.avi', '.mkv', '.webm', '.mpeg', '.mpg', '.3gp'}
 
 
-def scan_images(source, excluded_dirs=()):
+def scan_images(source, excluded_dirs=(), output=None):
     """Yield source paths, including old organized archives but never reports."""
     def scan_error(err):
         log.warning('[SIMILARITY] Cannot scan directory: %s', err)
 
     excluded = tuple(excluded_dirs)
+    output = source if output is None else output
     for root, dirs, files in os.walk(source, onerror=scan_error):
         dirs[:] = sorted(
             name for name in dirs
@@ -37,7 +38,31 @@ def scan_images(source, excluded_dirs=()):
         )
         for name in sorted(files):
             path = os.path.join(root, name)
-            if name not in SCAN_IGNORE_FILES and not os.path.islink(path):
+            ancestor = os.path.realpath(root)
+            staging = False
+            while True:
+                if (os.path.isfile(os.path.join(ancestor, '.copy_records.json'))
+                        or all(os.path.isdir(os.path.join(ancestor, directory))
+                               for directory in ('duplicate-files', 'needs-review'))):
+                    staging = (
+                        same_path(root, ancestor)
+                        and is_staging_name(name, ('.copy-records-', '.hashes-'))
+                    ) or (
+                        is_staging_name(name, ('.copy-',))
+                        and any(path_is_within(root, os.path.join(ancestor, directory))
+                                for directory in ('organized-images', 'duplicate-files', 'needs-review'))
+                    )
+                    if staging:
+                        break
+                parent = os.path.dirname(ancestor)
+                if parent == ancestor:
+                    break
+                ancestor = parent
+            if (name not in SCAN_IGNORE_FILES
+                    and not (same_path(root, output)
+                             and same_path(path, os.path.join(output, '.copy_records.json')))
+                    and not staging
+                    and not os.path.islink(path)):
                 yield {'path': path, 'original_name': name}
 
 
