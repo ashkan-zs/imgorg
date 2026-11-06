@@ -13,6 +13,8 @@ from urllib.parse import quote
 import imagehash
 from PIL import Image, ImageOps
 
+from path_utils import same_path
+
 
 REPORT_DIRECTORY = 'similar-images'
 SCAN_IGNORE_DIRS = {REPORT_DIRECTORY, '.git', '.venv', '__pycache__', '.pytest_cache'}
@@ -20,16 +22,18 @@ SCAN_IGNORE_FILES = {'.sha256_hashes.txt', 'report.json', 'report.html', '.DS_St
 VIDEO_EXTENSIONS = {'.mov', '.mp4', '.m4v', '.avi', '.mkv', '.webm', '.mpeg', '.mpg', '.3gp'}
 
 
-def scan_images(source):
+def scan_images(source, excluded_dirs=()):
     """Yield source paths, including old organized archives but never reports."""
     def scan_error(err):
         log.warning('[SIMILARITY] Cannot scan directory: %s', err)
 
+    excluded = tuple(excluded_dirs)
     for root, dirs, files in os.walk(source, onerror=scan_error):
         dirs[:] = sorted(
             name for name in dirs
             if name not in SCAN_IGNORE_DIRS
             and not os.path.islink(os.path.join(root, name))
+            and not any(same_path(os.path.join(root, name), directory) for directory in excluded)
         )
         for name in sorted(files):
             path = os.path.join(root, name)
@@ -71,7 +75,7 @@ def group_images(images, threshold):
     return groups
 
 
-def find_similar(candidates, source, threshold=5):
+def find_similar(candidates, source, threshold=5, output=None):
     """Hash each distinct successful path once; failures are similarity warnings."""
     if not 0 <= threshold <= 64:
         raise ValueError('Similarity threshold must be between 0 and 64')
@@ -88,6 +92,8 @@ def find_similar(candidates, source, threshold=5):
             continue
         try:
             relative = path.relative_to(source).as_posix()
+            if output is not None:
+                relative = Path(os.path.relpath(path, output)).as_posix()
             if path.is_symlink():
                 raise OSError('Symbolic links are excluded')
             if not path.is_file():
@@ -116,7 +122,8 @@ def find_similar(candidates, source, threshold=5):
         'algorithm': 'phash',
         'hash_size': 8,
         'threshold': threshold,
-        'path_base': 'source directory; paths use forward slashes',
+        'path_base': ('output directory' if output is not None else 'source directory')
+        + '; paths use forward slashes',
         'total_images_analyzed': len(images),
         'total_similarity_groups': len(groups),
         'groups': groups,
@@ -124,7 +131,7 @@ def find_similar(candidates, source, threshold=5):
 
 
 def render_html(report):
-    """Render escaped text and URL-encoded, source-relative local links."""
+    """Render escaped text and URL-encoded links relative to the path base."""
     parts = [
         '<!doctype html><html lang="en"><head><meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
@@ -151,7 +158,7 @@ def render_html(report):
     for group in report['groups']:
         parts.append(f'<section><h2>{html.escape(group["id"])}</h2><div class="images">')
         for member in group['members']:
-            # The report lives one directory below the source. Encoding prevents
+            # The report lives one directory below the path base. Encoding prevents
             # filenames containing #, ?, quotes, percent signs or : becoming URLs.
             url = html.escape('../' + quote(member['path'], safe='/'), quote=True)
             name = html.escape(member['original_name'])
@@ -177,7 +184,7 @@ def write_reports(report, source):
     directory = Path(source) / REPORT_DIRECTORY
     if directory.is_symlink():
         raise OSError(f'Report directory is a symbolic link: {directory}')
-    directory.mkdir(exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     outputs = {
         'report.json': json.dumps(report, indent=2, ensure_ascii=True) + '\n',
         'report.html': render_html(report),
@@ -208,12 +215,12 @@ def print_similarity_summary(report, dry_run=False):
             print(f'  {member["path"]!r} (distance {member["distance"]})')
 
 
-def run_similarity(candidates, source, threshold=5, dry_run=False):
-    report = find_similar(candidates, source, threshold)
+def run_similarity(candidates, source, threshold=5, dry_run=False, output=None):
+    report = find_similar(candidates, source, threshold, output=None if dry_run else output)
     print_similarity_summary(report, dry_run=dry_run)
     if not dry_run:
         try:
-            write_reports(report, source)
+            write_reports(report, source if output is None else output)
         except OSError as err:
             log.warning('[SIMILARITY] Could not write reports: %s', err)
     return report

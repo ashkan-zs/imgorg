@@ -12,6 +12,8 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
+from path_utils import path_is_within, same_path
+
 
 register_heif_opener()
 
@@ -53,7 +55,7 @@ def load_hash_file():
                 if len(file_hash) == 64:
                     hash_keys.add(file_hash)
 
-    except IOError:
+    except FileNotFoundError:
         pass
 
 
@@ -116,6 +118,11 @@ def get_image_date(file_path):
         os.path.getmtime(file_path)
     )
     return modified_date.strftime(dir_format)
+
+
+def validate_destination_path(destination, root):
+    if not path_is_within(destination, root):
+        raise OSError(f'Destination escapes generated output directory: {destination}')
 
 
 def move_to_duplicate_folder(path, date):
@@ -181,6 +188,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     file_hash = calculate_hash(file_path)
 
     if file_hash in hash_keys:
+        validate_destination_path(os.path.join(duplicate_dir, file_date), duplicate_dir)
         if dry_run:
             log.info("[DRY RUN] DUPLICATE: %s -> %s",
                      file_path, os.path.join(duplicate_dir, file_date))
@@ -205,8 +213,9 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     return destination
 
 
-def file_dates(path, dry_run=False, similarity_paths=None):
+def file_dates(path, dry_run=False, similarity_paths=None, output=None):
     load_hash_file()
+    output = os.path.realpath(output if output is not None else path)
 
     stats = {
         "organized": 0,
@@ -221,6 +230,7 @@ def file_dates(path, dry_run=False, similarity_paths=None):
             for directory in dirs
             if directory not in ignore_dirs
             and not os.path.islink(os.path.join(root, directory))
+            and not same_path(os.path.join(root, directory), output)
         )
 
         for filename in sorted(files):
@@ -237,12 +247,15 @@ def file_dates(path, dry_run=False, similarity_paths=None):
                 image_date = get_image_date(file_path)
 
                 if should_organized(filename):
-                    destination_dir = os.path.join(path, organized_images, image_date)
+                    destination_root = os.path.join(output, organized_images)
+                    destination_dir = os.path.join(destination_root, image_date)
                     category = "organized"
                 else:
+                    destination_root = need_review_dir
                     destination_dir = need_review_dir
                     category = "review"
 
+                validate_destination_path(destination_dir, destination_root)
                 destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run)
                 if similarity_paths is not None and destination is not None:
                     similarity_paths.append({
@@ -268,6 +281,28 @@ def print_summary(stats, dry_run=False):
     print(f"Total:        {sum(stats.values())}")
 
 
+def validate_output_path(source, output, directories, check_database=True):
+    ancestor = output
+    while not os.path.lexists(ancestor):
+        ancestor = os.path.dirname(ancestor)
+    if not os.path.isdir(ancestor):
+        raise ValueError(f'Output path is not a directory: {ancestor}')
+
+    for name in directories:
+        destination = os.path.join(output, name)
+        if os.path.islink(destination):
+            raise ValueError(f'Generated output directory is a symbolic link: {destination}')
+        if os.path.lexists(destination) and not os.path.isdir(destination):
+            raise ValueError(f'Generated output path is not a directory: {destination}')
+        if path_is_within(source, destination):
+            raise ValueError(f'Source must not be inside a generated output directory: {destination}')
+
+    database = os.path.join(output, '.sha256_hashes.txt')
+    if check_database and os.path.lexists(database):
+        if os.path.islink(database) or not os.path.isfile(database):
+            raise ValueError(f'Hash database must be a regular file: {database}')
+
+
 def main():
     global path, duplicate_dir, need_review_dir, data_file
 
@@ -280,6 +315,11 @@ def main():
         help='the directory you want to organize',
         nargs='?',
         default=os.getcwd()
+    )
+    parser.add_argument(
+        '--output',
+        metavar='PATH',
+        help='Output root for organized files and reports (default: source directory)'
     )
     parser.add_argument(
         '--dry-run',
@@ -308,10 +348,25 @@ def main():
     if not 0 <= args.similar_threshold <= 64:
         parser.error('--similar-threshold must be between 0 and 64')
 
-    path = os.path.abspath(args.src)
+    if args.output == '':
+        parser.error('--output must not be empty')
+
+    try:
+        path = os.path.realpath(os.path.expanduser(args.src))
+        output = os.path.realpath(os.path.expanduser(args.output)) if args.output is not None else path
+    except (OSError, ValueError) as err:
+        parser.error(f'Invalid source or output path: {err}')
 
     if not os.path.isdir(path):
         parser.error(f"Source directory does not exist: {path}")
+
+    directories = [similar] if args.find_similar_only else [organized_images, duplicate, need_review]
+    if args.find_similar and not args.find_similar_only:
+        directories.append(similar)
+    try:
+        validate_output_path(path, output, directories, check_database=not args.find_similar_only)
+    except (OSError, ValueError) as err:
+        parser.error(f'Invalid output path: {err}')
 
     if args.find_similar or args.find_similar_only:
         try:
@@ -324,29 +379,43 @@ def main():
 
     if args.find_similar_only:
         run_similarity(
-            scan_images(path), path, args.similar_threshold, dry_run=args.dry_run
+            scan_images(path, excluded_dirs=[output] if not same_path(output, path) else []),
+            path, args.similar_threshold, dry_run=args.dry_run,
+            output=output if args.output is not None else None
         )
         return
 
-    duplicate_dir = os.path.join(path, duplicate)
-    need_review_dir = os.path.join(path, need_review)
-    data_file = os.path.join(path, '.sha256_hashes.txt')
+    duplicate_dir = os.path.join(output, duplicate)
+    need_review_dir = os.path.join(output, need_review)
+    data_file = os.path.join(output, '.sha256_hashes.txt')
 
     if not args.dry_run:
-        os.makedirs(duplicate_dir, exist_ok=True)
-        os.makedirs(need_review_dir, exist_ok=True)
+        try:
+            os.makedirs(duplicate_dir, exist_ok=True)
+            os.makedirs(need_review_dir, exist_ok=True)
+        except OSError as err:
+            parser.exit(1, f'error: Cannot prepare output directory: {err}\n')
 
+    hash_keys.clear()
     similarity_paths = [] if args.find_similar else None
-    stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths)
+    try:
+        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths, output=output)
+    except OSError as err:
+        parser.exit(1, f'error: Cannot read hash database: {err}\n')
 
     if not args.dry_run:
-        save_hash_file()
+        try:
+            save_hash_file()
+        except OSError as err:
+            parser.exit(1, f'error: Cannot save hash database: {err}\n')
 
     print_summary(stats, dry_run=args.dry_run)
 
     if args.find_similar:
         run_similarity(
-            similarity_paths, path, args.similar_threshold, dry_run=args.dry_run
+            similarity_paths, path if args.dry_run else output,
+            args.similar_threshold, dry_run=args.dry_run,
+            output=output if args.output is not None else None
         )
 
 
