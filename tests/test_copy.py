@@ -265,3 +265,57 @@ def test_interrupted_staging_artifacts_are_not_inputs(tmp_path):
     result = run_cli(source, '--copy')
     assert 'Total:        1' in result.stdout
     assert all(path.exists() for path in artifacts)
+
+
+def test_recovery_hashes_are_loaded_before_new_sources(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'z.jpg')
+    run_cli(source, '--copy', '--output', output)
+    # Simulate termination after publication but before the hash database is saved.
+    (output / '.sha256_hashes.txt').unlink()
+    duplicate = add_file(source / 'a.jpg', original.read_bytes())
+    before = snapshot_files(output)
+    preview = run_cli(source, '--copy', '--output', output, '--dry-run')
+    assert 'Duplicates:   1' in preview.stdout
+    assert snapshot_files(output) == before
+    result = run_cli(source, '--copy', '--output', output)
+    assert 'Duplicates:   1' in result.stdout
+    assert [p.name for p in (output / 'organized-images').rglob('*.jpg')] == ['z.jpg']
+    assert [p.name for p in (output / 'duplicate-files').rglob('*.jpg')] == ['a.jpg']
+    assert duplicate.read_bytes() == original.read_bytes()
+
+
+@pytest.mark.parametrize('damage', ['missing', 'modified'])
+def test_recovery_does_not_restore_unverified_destinations(tmp_path, damage):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'z.jpg')
+    run_cli(source, '--copy', '--output', output)
+    (output / '.sha256_hashes.txt').unlink()
+    destination = next((output / 'organized-images').rglob('z.jpg'))
+    if damage == 'missing':
+        destination.unlink()
+    else:
+        destination.write_bytes(b'changed')
+    add_file(source / 'a.jpg', original.read_bytes())
+    result = run_cli(source, '--copy', '--output', output)
+    assert 'Organized:    1' in result.stdout
+    assert 'Duplicates:   1' in result.stdout
+    if damage == 'modified':
+        assert destination.read_bytes() == b'changed'
+
+
+def test_recovery_restores_multiple_records_before_similarity(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    make_similar_photos(source)
+    run_cli(source, '--copy', '--output', output)
+    (output / '.sha256_hashes.txt').unlink()
+    add_file(source / 'a.jpg', (source / 'one' / 'photo.jpg').read_bytes())
+    add_file(source / 'b.jpg', (source / 'two' / 'photo.jpg').read_bytes())
+    result = run_cli(source, '--copy', '--output', output, '--find-similar')
+    assert 'Duplicates:   2' in result.stdout
+    assert 'Images analyzed: 2' in result.stdout
+    assert len(list((output / 'organized-images').rglob('*.jpg'))) == 2
+    assert_report_links(output)

@@ -350,6 +350,16 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
 
 def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None):
     load_hash_file()
+    if copy_records is not None:
+        for source, record in copy_records.records.items():
+            if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
+                continue
+            digest = record['hash']
+            try:
+                if copy_records.previous(source, digest) is not None:
+                    hash_keys.add(digest)
+            except (OSError, ValueError, TypeError) as err:
+                log.warning('Cannot verify copy record for %s: %s', source, err)
     output = os.path.realpath(output if output is not None else path)
 
     stats = {
