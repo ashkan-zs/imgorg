@@ -8,13 +8,18 @@ import os
 import shutil
 import time
 from datetime import datetime
+from PIL import Image, UnidentifiedImageError
+from PIL.ExifTags import Base, IFD
+from pillow_heif import register_heif_opener
 
+
+register_heif_opener()
 
 log.getLogger().setLevel(log.INFO)
 
 
 # Organized extensions
-organized_extensions = ['heic', 'jpg', 'jpeg', 'png', 'gif', 'tiff', 'tif', 'cr2', 'psd', 'mov', 'mp4']
+organized_extensions = ['heic', 'heif', 'jpg', 'jpeg', 'png', 'gif', 'tiff', 'tif', 'cr2', 'psd', 'mov', 'mp4']
 
 ''' Directory structure for moving images
     %Y: 4 digit
@@ -75,12 +80,41 @@ def calculate_hash(file_path):
         return sha256.hexdigest()
 
 
-def get_image_date(path):
-    ctime = time.ctime(os.path.getmtime(path))
-    image_date = datetime.strptime(ctime, '%a %b %d %H:%M:%S %Y')
-    image_date = image_date.strftime(dir_format)
+def get_image_date(file_path):
+    extension = os.path.splitext(file_path)[1].lower()
 
-    return image_date
+    if extension in {".jpg", ".jpeg", ".tif", ".tiff", ".heic", ".heif"}:
+        try:
+            with Image.open(file_path) as image:
+                exif = image.getexif()
+                date_original = exif.get_ifd(IFD.Exif).get(
+                    Base.DateTimeOriginal
+                )
+
+                if date_original:
+                    date = datetime.strptime(
+                        date_original,
+                        "%Y:%m:%d %H:%M:%S"
+                    )
+                    return date.strftime(dir_format)
+
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            KeyError,
+            Image.DecompressionBombError,
+            UnidentifiedImageError
+        ):
+            log.debug(
+                "EXIF date unavailable for %s; using mtime",
+                file_path
+            )
+
+    modified_date = datetime.fromtimestamp(
+        os.path.getmtime(file_path)
+    )
+    return modified_date.strftime(dir_format)
 
 
 def move_to_duplicate_folder(path, date):
