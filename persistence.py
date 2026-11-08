@@ -38,6 +38,7 @@ class Persistence:
     def __init__(self, output, dry_run=False):
         self.path = os.path.join(output, DATABASE_NAME)
         self.connection = None
+        validate_database_files(output)
         if dry_run and not os.path.exists(self.path):
             return
         if dry_run:

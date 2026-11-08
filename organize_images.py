@@ -699,7 +699,7 @@ def main():
                            recovered_sources=recovered_sources)
         if not args.dry_run:
             store.add_hashes(hash_keys)
-    except (OSError, sqlite3.Error) as err:
+    except (OSError, sqlite3.Error, ValueError) as err:
         parser.exit(1, f'error: SQLite persistence failure: {err}\n')
     finally:
         if store is not None:
