@@ -165,6 +165,26 @@ def test_copy_never_overwrites_existing_content(tmp_path):
     assert source.read_bytes() == b'new'
 
 
+def test_copy_cleanup_preserves_replaced_staging_file(tmp_path):
+    source = add_file(tmp_path / 'photo.jpg', b'source')
+    output = tmp_path / 'output'
+    output.mkdir()
+    replacement = add_file(tmp_path / 'replacement', b'unrelated')
+    staged = []
+
+    def replace_and_fail(src, dst):
+        staged.append(Path(dst))
+        os.replace(replacement, dst)
+        raise OSError('copy failed')
+
+    with patch.object(organizer.shutil, 'copy2', side_effect=replace_and_fail):
+        with pytest.raises(OSError, match='copy failed'):
+            organizer.copy_without_overwriting(source, output)
+    assert source.read_bytes() == b'source'
+    assert staged[0].read_bytes() == b'unrelated'
+    assert not (output / 'photo.jpg').exists()
+
+
 def test_distinct_hardlinked_sources_remain_duplicates(tmp_path):
     source = tmp_path / 'source'
     first = add_file(source / 'first.jpg')

@@ -2,12 +2,27 @@
 
 import os
 import sqlite3
+import stat
 from pathlib import Path
 
 from path_utils import same_path
 
 DATABASE_NAME = '.organize-image.sqlite3'
 DATABASE_FILES = tuple(DATABASE_NAME + suffix for suffix in ('', '-journal', '-wal', '-shm'))
+
+
+def validate_database_files(output):
+    """Reject aliases that could let SQLite write through another directory entry."""
+    for name in DATABASE_FILES:
+        path = os.path.join(output, name)
+        try:
+            status = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(status.st_mode):
+            raise ValueError(f'SQLite database artifact must be a regular, non-symlink file: {path}')
+        if status.st_nlink > 1:
+            raise ValueError(f'SQLite database artifact has multiple hard links; remove the alias before running: {path}')
 
 
 def is_database_artifact(path, root, source, output):
@@ -33,8 +48,13 @@ class Persistence:
             uri = Path(self.path).absolute().as_uri() + '?mode=ro&immutable=1'
             self.connection = sqlite3.connect(uri, uri=True)
         else:
+            validate_database_files(output)
             self.connection = sqlite3.connect(self.path, isolation_level=None)
             try:
+                # sqlite3 accepts a pathname, not an already validated file
+                # descriptor. Recheck before the first SQL write; replacement
+                # between this check and SQLite's use remains a race.
+                validate_database_files(output)
                 # Rollback journaling avoids persistent WAL/SHM files for this local CLI.
                 self.connection.execute('PRAGMA journal_mode=DELETE')
                 self.connection.execute('PRAGMA synchronous=FULL')

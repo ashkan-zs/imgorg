@@ -111,6 +111,36 @@ def test_dry_run_refuses_pending_journal_without_modifying_it(tmp_path):
     assert snapshot_files(tmp_path) == before
 
 
+@pytest.mark.parametrize('name', DATABASE_FILES)
+def test_hardlinked_database_artifact_fails_before_output_mutation(tmp_path, name):
+    source = tmp_path / 'source'
+    original = add_file(source / 'photo.jpg', b'photo')
+    output = tmp_path / 'output'
+    output.mkdir()
+    external = add_file(tmp_path / 'external', b'')
+    os.link(external, output / name)
+    before = snapshot_files(tmp_path)
+
+    result = subprocess.run([sys.executable, str(Path(organizer.__file__)), '--src', str(source),
+                             '--output', str(output)], capture_output=True, text=True)
+    assert result.returncode != 0
+    assert 'multiple hard links' in result.stderr
+    assert snapshot_files(tmp_path) == before
+    assert original.read_bytes() == b'photo'
+    assert not (output / 'needs-review').exists()
+    assert not (output / 'duplicate-files').exists()
+
+
+def test_persistence_rejects_hardlinked_database_when_opened_directly(tmp_path):
+    external = add_file(tmp_path / 'external', b'')
+    output = tmp_path / 'output'
+    output.mkdir()
+    os.link(external, output / DATABASE_NAME)
+    with pytest.raises(ValueError, match='multiple hard links'):
+        Persistence(str(output))
+    assert external.read_bytes() == b''
+
+
 def test_database_artifacts_excluded_only_at_output_root(tmp_path):
     source = tmp_path / 'source'
     source.mkdir()

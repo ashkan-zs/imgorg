@@ -78,6 +78,39 @@ def test_recovery_refuses_replaced_destination_and_preserves_source(tmp_path):
     assert 'Unresolved move intent' in result.stderr
 
 
+def test_recovery_after_source_replacement_keeps_both_files(tmp_path):
+    source_root = tmp_path / 'source'
+    source = add_file(source_root / 'photo.jpg', b'original')
+    output = tmp_path / 'output'
+    destination_dir = output / 'organized-images' / '2024' / 'January'
+    destination_dir.mkdir(parents=True)
+    replacement = add_file(tmp_path / 'replacement.jpg', b'unrelated')
+    digest = app.calculate_hash(source)
+    store = app.Persistence(str(output))
+    records = app.MoveRecords(str(output), store)
+    real_link = os.link
+
+    def replace_after_link(src, dst, **kwargs):
+        real_link(src, dst, **kwargs)
+        os.replace(replacement, source)
+
+    with patch.object(app.os, 'link', side_effect=replace_after_link):
+        with pytest.raises(OSError, match='changed before removal'):
+            app.move_without_overwriting(source, destination_dir, expected_hash=digest,
+                before_publish=lambda dst, identity: records.remember(source, digest, dst, 'organized', identity))
+    store.close()
+    result = run_cli(source_root, '--output', output)
+    assert result.returncode == 0
+    assert not source.exists()
+    assert (destination_dir / 'photo.jpg').read_bytes() == b'original'
+    files = list((output / 'organized-images').rglob('photo*.jpg'))
+    assert len(files) == 2
+    assert {path.read_bytes() for path in files} == {b'original', b'unrelated'}
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert {row[0] for row in db.execute('SELECT digest FROM exact_hashes')} == {
+            digest, app.calculate_hash(next(path for path in files if path.read_bytes() == b'unrelated'))}
+
+
 def test_finish_move_database_failure_keeps_recoverable_intent(tmp_path, monkeypatch):
     source = tmp_path / 'source'
     original = add_file(source / 'z.jpg', b'original')

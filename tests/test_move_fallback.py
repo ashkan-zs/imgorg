@@ -131,6 +131,36 @@ def test_source_unlink_failure_keeps_complete_destination(tmp_path, fallback):
     assert not list(output.glob('.copy-*'))
 
 
+def test_same_filesystem_move_refuses_replaced_source_after_link(tmp_path):
+    source = add_file(tmp_path / 'source' / 'photo.jpg', b'original')
+    output = tmp_path / 'output'
+    output.mkdir()
+    replacement = add_file(tmp_path / 'replacement.jpg', b'unrelated')
+    real_link = os.link
+
+    def replace_after_link(src, dst, **kwargs):
+        real_link(src, dst, **kwargs)
+        os.replace(replacement, source)
+
+    with patch.object(organizer.os, 'link', side_effect=replace_after_link):
+        with pytest.raises(OSError, match='changed before removal'):
+            organizer.move_without_overwriting(source, output)
+    assert source.read_bytes() == b'unrelated'
+    assert (output / 'photo.jpg').read_bytes() == b'original'
+
+
+def test_same_filesystem_move_and_collision_still_remove_original(tmp_path):
+    source = add_file(tmp_path / 'source' / 'photo.jpg', b'original')
+    output = tmp_path / 'output'
+    existing = add_file(output / 'photo.jpg', b'existing')
+    destination = Path(organizer.move_without_overwriting(source, output,
+                       expected_hash=organizer.calculate_hash(source)))
+    assert destination.name == 'photo_1.jpg'
+    assert destination.read_bytes() == b'original'
+    assert existing.read_bytes() == b'existing'
+    assert not source.exists()
+
+
 def test_interrupted_staging_never_publishes_partial_and_is_not_scanned(tmp_path):
     source = tmp_path / 'source'
     original = add_file(source / 'photo.jpg', b'complete photo contents')

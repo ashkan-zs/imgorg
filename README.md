@@ -96,6 +96,16 @@ files are excluded from later scans and are not automatically removed. Relative
 paths are resolved against the working directory; `~`, `..`, and directory aliases
 are normalized.
 
+Before removing a moved source, the organizer checks that its pathname still
+identifies the published file. Python has no atomic identity-conditional unlink,
+so another process replacing that pathname after the check can still race with
+removal. Run the organizer without concurrent changes to its source or output.
+SQLite database files and sidecars with multiple hard links are rejected before
+writable database access; SQLite's pathname-based opening also has a replacement
+race if another process changes the database entry concurrently. Copy staging
+cleanup checks the temporary file's inode first, but that check and unlink are
+also separate operations.
+
 Move mode commits an intent before each destination publication. After publication,
 it verifies the destination and commits the SHA-256 hash with the completed state.
 On restart, pending destinations are checked by location, filesystem identity, and

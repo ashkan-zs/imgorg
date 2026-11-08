@@ -18,7 +18,7 @@ from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
 from path_utils import is_copy_staging, is_staging_name, path_is_within, same_directory_entry, same_path
-from persistence import DATABASE_NAME, DATABASE_FILES, Persistence, is_database_artifact
+from persistence import DATABASE_NAME, Persistence, is_database_artifact, validate_database_files
 
 
 register_heif_opener()
@@ -126,11 +126,12 @@ def move_without_overwriting(source, destination_dir, expected_hash=None, before
     while True:
         candidate_name = name if suffix == 0 else f'{stem}_{suffix}{extension}'
         destination = os.path.join(destination_dir, candidate_name)
+        source_status = os.stat(source, follow_symlinks=False)
         if before_publish is not None:
             if os.path.lexists(destination):
                 suffix += 1
                 continue
-            before_publish(destination, os.stat(source, follow_symlinks=False))
+            before_publish(destination, source_status)
         try:
             # A hard link creates the destination only if it does not exist.
             os.link(source, destination, follow_symlinks=False)
@@ -148,6 +149,18 @@ def move_without_overwriting(source, destination_dir, expected_hash=None, before
                 suffix += 1
                 continue
 
+        # The source pathname may have been replaced after link(). Refuse to
+        # remove it unless both entries still name the inode we published.
+        # Python has no atomic identity-conditional unlink: a replacement in
+        # the short interval after these checks still requires external locking.
+        if expected_hash is not None and calculate_hash(destination) != expected_hash:
+            raise OSError('Published move destination failed hash verification')
+        source_now = os.stat(source, follow_symlinks=False)
+        destination_now = os.stat(destination, follow_symlinks=False)
+        original = (source_status.st_dev, source_status.st_ino)
+        if ((source_now.st_dev, source_now.st_ino) != original
+                or (destination_now.st_dev, destination_now.st_ino) != original):
+            raise OSError('Move source or published destination changed before removal')
         # Keep a complete destination if source removal fails. Removing it here
         # could delete a different file if the destination was replaced meanwhile.
         os.unlink(source)
@@ -241,9 +254,16 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
     if os.path.islink(source) or not os.path.isfile(source):
         raise OSError(f'Copy source must be a regular file: {source}')
     descriptor, temporary = tempfile.mkstemp(prefix='.copy-', dir=destination_dir)
-    os.close(descriptor)
+    try:
+        status = os.fstat(descriptor)
+        temporary_identity = (status.st_dev, status.st_ino)
+    finally:
+        os.close(descriptor)
     try:
         shutil.copy2(source, temporary)
+        status = os.stat(temporary, follow_symlinks=False)
+        if (status.st_dev, status.st_ino) != temporary_identity:
+            raise OSError('Staged file was replaced during copying')
         if expected_hash is not None and calculate_hash(temporary) != expected_hash:
             raise OSError('Source changed during copying')
         stem, extension = os.path.splitext(os.path.basename(source))
@@ -251,8 +271,11 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
         while True:
             name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
             destination = os.path.join(destination_dir, name)
+            status = os.stat(temporary, follow_symlinks=False)
+            if (status.st_dev, status.st_ino) != temporary_identity:
+                raise OSError('Staged file was replaced before publication')
             if before_publish is not None:
-                before_publish(destination, os.stat(temporary))
+                before_publish(destination, status)
             try:
                 # Publish the completed temporary inode exclusively, never the source inode.
                 try:
@@ -265,8 +288,14 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
             except FileExistsError:
                 suffix += 1
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        try:
+            status = os.stat(temporary, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            # An identity check narrows, but cannot close, the stat/unlink race.
+            if (status.st_dev, status.st_ino) == temporary_identity:
+                os.unlink(temporary)
 
 
 class CopyRecords:
@@ -558,10 +587,7 @@ def validate_output_path(source, output, directories, check_database=True):
             raise ValueError(f'Source must not be inside a generated output directory: {destination}')
 
     if check_database:
-        for name in DATABASE_FILES:
-            database = os.path.join(output, name)
-            if os.path.lexists(database) and (os.path.islink(database) or not os.path.isfile(database)):
-                raise ValueError(f'SQLite database artifact must be a regular file: {database}')
+        validate_database_files(output)
 
 
 def main():
