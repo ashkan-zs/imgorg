@@ -42,3 +42,21 @@ def path_is_within(path, directory):
         if parent == path:
             return False
         path = parent
+
+
+def is_copy_staging(root, name, database_name):
+    """Recognize temporary copies only inside a known output's generated trees."""
+    if not is_staging_name(name, ('.copy-',)):
+        return False
+    ancestor = os.path.realpath(root)
+    while True:
+        if (os.path.isfile(os.path.join(ancestor, database_name))
+                or all(os.path.isdir(os.path.join(ancestor, directory))
+                       for directory in ('duplicate-files', 'needs-review'))):
+            if any(path_is_within(root, os.path.join(ancestor, directory))
+                   for directory in ('organized-images', 'duplicate-files', 'needs-review')):
+                return True
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            return False
+        ancestor = parent

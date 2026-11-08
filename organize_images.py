@@ -8,6 +8,7 @@ import os
 import shutil
 import time
 import sqlite3
+import stat
 import tempfile
 import ctypes
 import sys
@@ -16,7 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
-from path_utils import is_staging_name, path_is_within, same_path
+from path_utils import is_copy_staging, is_staging_name, path_is_within, same_path
 from persistence import DATABASE_NAME, DATABASE_FILES, Persistence, is_database_artifact
 
 
@@ -110,14 +111,14 @@ def validate_destination_path(destination, root):
         raise OSError(f'Destination escapes generated output directory: {destination}')
 
 
-def move_to_duplicate_folder(path, date):
+def move_to_duplicate_folder(path, date, expected_hash=None):
     duplicate_path = os.path.join(duplicate_dir, date)
     if not os.path.isdir(duplicate_path):
         os.makedirs(duplicate_path)
-    move_without_overwriting(path, duplicate_path)
+    move_without_overwriting(path, duplicate_path, expected_hash=expected_hash)
 
 
-def move_without_overwriting(source, destination_dir):
+def move_without_overwriting(source, destination_dir, expected_hash=None):
     name = os.path.basename(source)
     stem, extension = os.path.splitext(name)
     suffix = 0
@@ -134,30 +135,17 @@ def move_without_overwriting(source, destination_dir):
         except OSError as err:
             if err.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
                 raise
+            if not os.path.islink(source):
+                return move_via_staging(source, destination_dir, expected_hash=expected_hash)
             try:
-                if os.path.islink(source):
-                    os.symlink(os.readlink(source), destination)
-                else:
-                    with open(source, 'rb') as source_file:
-                        with open(destination, 'xb') as destination_file:
-                            shutil.copyfileobj(source_file, destination_file)
-                    shutil.copystat(source, destination)
+                os.symlink(os.readlink(source), destination)
             except FileExistsError:
                 suffix += 1
                 continue
-            except Exception:
-                if os.path.lexists(destination):
-                    os.unlink(destination)
-                raise
 
-        try:
-            os.unlink(source)
-        except OSError:
-            try:
-                os.unlink(destination)
-            except OSError:
-                log.exception("Failed to roll back destination: %s", destination)
-            raise
+        # Keep a complete destination if source removal fails. Removing it here
+        # could delete a different file if the destination was replaced meanwhile.
+        os.unlink(source)
         return destination
 
 
@@ -178,6 +166,65 @@ def rename_without_overwriting(source, destination):
     if function(*arguments) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error), destination)
+
+
+
+def move_via_staging(source, destination_dir, expected_hash=None):
+    """Copy and verify before exclusive publication; retain the source until then."""
+    def source_identity():
+        status = os.stat(source, follow_symlinks=False)
+        if not stat.S_ISREG(status.st_mode):
+            raise OSError(f'Move source must be a regular file: {source}')
+        return (status.st_dev, status.st_ino, status.st_size,
+                status.st_mtime_ns, status.st_ctime_ns)
+
+    identity = source_identity()
+    if expected_hash is None:
+        expected_hash = calculate_hash(source)
+    descriptor, temporary = tempfile.mkstemp(prefix='.copy-', dir=destination_dir)
+    try:
+        status = os.fstat(descriptor)
+        temporary_identity = (status.st_dev, status.st_ino)
+    finally:
+        os.close(descriptor)
+    try:
+        shutil.copy2(source, temporary)
+        status = os.stat(temporary, follow_symlinks=False)
+        if (status.st_dev, status.st_ino) != temporary_identity:
+            raise OSError('Staged file was replaced during copying')
+        if calculate_hash(temporary) != expected_hash or source_identity() != identity:
+            raise OSError('Source changed during copying')
+
+        stem, extension = os.path.splitext(os.path.basename(source))
+        suffix = 0
+        while True:
+            name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
+            destination = os.path.join(destination_dir, name)
+            try:
+                try:
+                    os.link(temporary, destination)
+                except OSError as err:
+                    if err.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                        raise
+                    rename_without_overwriting(temporary, destination)
+                break
+            except FileExistsError:
+                suffix += 1
+
+        # A failed unlink must never remove a destination that another process
+        # may have replaced. A complete extra copy is safer than deleting it.
+        if source_identity() != identity:
+            raise OSError('Source changed before removal')
+        os.unlink(source)
+        return destination
+    finally:
+        try:
+            status = os.stat(temporary, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if (status.st_dev, status.st_ino) == temporary_identity:
+                os.unlink(temporary)
 
 
 def copy_without_overwriting(source, destination_dir, expected_hash=None, before_publish=None):
@@ -294,7 +341,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
             log.info("[DRY RUN] DUPLICATE: %s -> %s",
                      file_path, os.path.join(duplicate_dir, file_date))
         else:
-            move_to_duplicate_folder(file_path, file_date)
+            move_to_duplicate_folder(file_path, file_date, expected_hash=file_hash)
 
         stats['duplicates'] += 1
         return
@@ -304,7 +351,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
         destination = file_path
     else:
         os.makedirs(destination_dir, exist_ok=True)
-        destination = move_without_overwriting(file_path, destination_dir)
+        destination = move_without_overwriting(file_path, destination_dir, expected_hash=file_hash)
 
     hash_keys.add(file_hash)
 
@@ -344,7 +391,8 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
         )
 
         for filename in sorted(files):
-            if (is_database_artifact(os.path.join(root, filename), root, path, output)
+            if (is_copy_staging(root, filename, DATABASE_NAME)
+                or is_database_artifact(os.path.join(root, filename), root, path, output)
                 or filename in ignore_files
                 or (same_path(root, path) and filename == '.copy_records.json')
                 or (

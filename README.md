@@ -85,9 +85,13 @@ python organize_images.py --src ./photos --output ./sorted --dry-run
 Organized files go into `OUTPUT/organized-images/`, exact duplicates into
 `OUTPUT/duplicate-files/`, and other files into `OUTPUT/needs-review/`.
 `OUTPUT/similar-images/` is created only when a similarity mode is requested.
-Files are moved using the existing collision-safe transfers; `--output` does
-not enable copying. Relative paths are resolved against the working directory;
-`~`, `..`, and directory aliases are normalized.
+Files are moved using collision-safe transfers; `--output` does not enable copy
+mode. When a move requires copying across filesystems, the copy is staged and
+verified before exclusive publication. If removing the source then fails, the
+complete destination is retained and the error is reported. Interrupted staging
+files are excluded from later scans and are not automatically removed. Relative
+paths are resolved against the working directory; `~`, `..`, and directory aliases
+are normalized.
 
 The SQLite database lives at `OUTPUT/.organize-image.sqlite3`, so repeat runs and
 different sources targeting the same output share that library's duplicate
