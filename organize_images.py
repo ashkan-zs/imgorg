@@ -7,7 +7,7 @@ import logging as log
 import os
 import shutil
 import time
-import json
+import sqlite3
 import tempfile
 import ctypes
 import sys
@@ -17,6 +17,7 @@ from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
 from path_utils import is_staging_name, path_is_within, same_path
+from persistence import DATABASE_NAME, DATABASE_FILES, Persistence, is_database_artifact
 
 
 register_heif_opener()
@@ -48,26 +49,6 @@ ignore_files = ['.gitignore', '.sha256_hashes.txt']
 
 # File for saving hashes
 hash_keys = set()
-
-def load_hash_file():
-    try:
-        with open(data_file, 'r') as file:
-            for line in file:
-                file_hash = line.strip()
-
-                # SHA-256 hashes have 64 hex characters
-                if len(file_hash) == 64:
-                    hash_keys.add(file_hash)
-
-    except FileNotFoundError:
-        pass
-
-
-def save_hash_file():
-    with open(data_file, 'w') as file:
-        for file_hash in sorted(hash_keys):
-            file.write(f'{file_hash}\n')
-
 
 def should_organized(file_name):
     splits = file_name.split('.')
@@ -232,16 +213,10 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
 
 
 class CopyRecords:
-    def __init__(self, output):
+    def __init__(self, output, store):
         self.output = output
-        self.path = os.path.join(output, '.copy_records.json')
-        try:
-            with open(self.path) as file:
-                self.records = json.load(file)
-            if not isinstance(self.records, dict):
-                raise ValueError('Copy records must be an object')
-        except FileNotFoundError:
-            self.records = {}
+        self.store = store
+        self.records = store.records()
 
     def previous(self, source, digest):
         key = os.path.realpath(source)
@@ -264,23 +239,14 @@ class CopyRecords:
         return destination, category
 
     def remember(self, source, digest, destination, category, identity=None):
-        records = dict(self.records)
-        records[os.path.realpath(source)] = {
-            'hash': digest, 'destination': os.path.relpath(destination, self.output),
-            'category': category,
-        }
-        if identity is not None:
-            records[os.path.realpath(source)]['identity'] = [identity.st_dev, identity.st_ino]
-        descriptor, temporary = tempfile.mkstemp(prefix='.copy-records-', dir=self.output)
-        try:
-            with os.fdopen(descriptor, 'w') as file:
-                json.dump(records, file, indent=2)
-                file.write('\n')
-            os.replace(temporary, self.path)
-            self.records = records
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        key = os.path.realpath(source)
+        relative = os.path.relpath(destination, self.output)
+        device = None if identity is None else identity.st_dev
+        inode = None if identity is None else identity.st_ino
+        # Commit the intent before attempting exclusive filesystem publication.
+        self.store.save_intent(key, digest, relative, category, device, inode)
+        self.records[key] = {'hash': digest, 'destination': relative, 'category': category,
+                             'identity': None if identity is None else [device, inode]}
 
 
 def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None):
@@ -349,7 +315,6 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
 
 
 def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None):
-    load_hash_file()
     if copy_records is not None:
         for source, record in copy_records.records.items():
             if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
@@ -379,11 +344,14 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
         )
 
         for filename in sorted(files):
-            if filename in ignore_files or (
+            if (is_database_artifact(os.path.join(root, filename), root, path, output)
+                or filename in ignore_files
+                or (same_path(root, path) and filename == '.copy_records.json')
+                or (
                 same_path(root, output)
                 and (same_path(os.path.join(root, filename), os.path.join(output, '.copy_records.json'))
                      or is_staging_name(filename, ('.copy-records-', '.hashes-')))
-            ):
+                )):
                 continue
 
             file_path = os.path.join(root, filename)
@@ -412,6 +380,8 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                         'original_name': filename,
                     })
 
+            except sqlite3.Error:
+                raise
             except Exception as err:
                 stats["errors"] += 1
                 log.error("Failed to process %s: %s", file_path, err)
@@ -446,14 +416,15 @@ def validate_output_path(source, output, directories, check_database=True):
         if path_is_within(source, destination):
             raise ValueError(f'Source must not be inside a generated output directory: {destination}')
 
-    database = os.path.join(output, '.sha256_hashes.txt')
-    if check_database and os.path.lexists(database):
-        if os.path.islink(database) or not os.path.isfile(database):
-            raise ValueError(f'Hash database must be a regular file: {database}')
+    if check_database:
+        for name in DATABASE_FILES:
+            database = os.path.join(output, name)
+            if os.path.lexists(database) and (os.path.islink(database) or not os.path.isfile(database)):
+                raise ValueError(f'SQLite database artifact must be a regular file: {database}')
 
 
 def main():
-    global path, duplicate_dir, need_review_dir, data_file
+    global path, duplicate_dir, need_review_dir
 
     parser = argparse.ArgumentParser(
         description='This is a script for organizing photos by date'
@@ -540,15 +511,6 @@ def main():
 
     duplicate_dir = os.path.join(output, duplicate)
     need_review_dir = os.path.join(output, need_review)
-    data_file = os.path.join(output, '.sha256_hashes.txt')
-
-    copy_records = None
-    if args.copy:
-        try:
-            copy_records = CopyRecords(output)
-        except (OSError, ValueError) as err:
-            parser.error(f'Cannot read copy records: {err}')
-
     if not args.dry_run:
         try:
             os.makedirs(duplicate_dir, exist_ok=True)
@@ -556,28 +518,22 @@ def main():
         except OSError as err:
             parser.exit(1, f'error: Cannot prepare output directory: {err}\n')
 
+    store = None
     hash_keys.clear()
     similarity_paths = [] if args.find_similar else None
     try:
-        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths, output=output, copy_records=copy_records)
-    except OSError as err:
-        parser.exit(1, f'error: Cannot read hash database: {err}\n')
-
-    if not args.dry_run:
-        try:
-            if args.copy:
-                descriptor, temporary = tempfile.mkstemp(prefix='.hashes-', dir=output)
-                try:
-                    with os.fdopen(descriptor, 'w') as file:
-                        file.writelines(f'{digest}\n' for digest in sorted(hash_keys))
-                    os.replace(temporary, data_file)
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
-            else:
-                save_hash_file()
-        except OSError as err:
-            parser.exit(1, f'error: Cannot save hash database: {err}\n')
+        store = Persistence(output, dry_run=args.dry_run)
+        hash_keys.update(store.hashes())
+        copy_records = CopyRecords(output, store) if args.copy else None
+        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths,
+                           output=output, copy_records=copy_records)
+        if not args.dry_run:
+            store.add_hashes(hash_keys)
+    except (OSError, sqlite3.Error) as err:
+        parser.exit(1, f'error: SQLite persistence failure: {err}\n')
+    finally:
+        if store is not None:
+            store.close()
 
     print_summary(stats, dry_run=args.dry_run)
 

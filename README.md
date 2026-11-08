@@ -42,7 +42,7 @@ Support depends on the filesystem/driver, including exFAT and network mounts; if
 neither primitive is supported, copying fails safely. Temporary files are removed
 on ordinary failures.
 
-`OUTPUT/.copy_records.json` records copy intents before publication by resolved absolute
+`OUTPUT/.organize-image.sqlite3` records copy intents before publication by resolved absolute
 source path, SHA-256, destination, category, and staged filesystem identity. Only an
 existing destination with matching identity and contents counts as completed. An
 unchanged source with a verified existing copy
@@ -59,9 +59,10 @@ COPY` operations, and writes neither database nor reports. Combined similarity m
 uses successful or reused nonduplicate destinations; dry-run uses original paths.
 `--copy --find-similar-only` is rejected because archive-only scanning is read-only.
 
-Run only one organizer against an output library at a time. Copy records and the hash
-database are atomically replaced individually, not as one transaction. After process
-termination, a published copy can be recognized from its intent and the hash database
+Run only one organizer against an output library at a time. SQLite commits each copy
+intent before publication, but a filesystem publication and a database commit cannot
+form one atomic transaction. The database uses SQLite rollback journaling and FULL
+synchronous mode. After process termination, a published copy can be recognized from its intent and the hash database
 repaired on the next non-dry run. Unpublished intents are retried without adopting
 unrelated files. Leftover staging files are excluded from organization and archive
 similarity scans in the corresponding output locations (temporary names use `.copy-`,
@@ -73,7 +74,7 @@ cannot prove provenance. Originals are retained.
 
 ### Output directory
 
-By default, outputs and `.sha256_hashes.txt` stay under `--src`, as before.
+By default, outputs and `.organize-image.sqlite3` stay under `--src`.
 Use `--output PATH` to choose a separate output root:
 
 ```sh
@@ -88,11 +89,12 @@ Files are moved using the existing collision-safe transfers; `--output` does
 not enable copying. Relative paths are resolved against the working directory;
 `~`, `..`, and directory aliases are normalized.
 
-The hash database lives at `OUTPUT/.sha256_hashes.txt`, so repeat runs and
+The SQLite database lives at `OUTPUT/.organize-image.sqlite3`, so repeat runs and
 different sources targeting the same output share that library's duplicate
 history. A database at a different source location is left untouched and is
 not automatically migrated or merged. Keep using the same output root to retain
-its history. Similarity-only mode neither reads nor writes either database.
+its history. Similarity-only mode does not open the SQLite database. Existing
+legacy hash and copy-record files are not imported or modified.
 
 Output may equal the source, be outside it, or be nested inside it. A distinct
 output subtree inside the source is excluded entirely from input scanning,
@@ -100,12 +102,14 @@ including pre-existing files there. Normal organization also continues to skip
 the standard generated directory names anywhere in the source. Sources located
 inside one of the configured generated destinations are rejected, as are
 symlinks or files occupying generated directory paths. Choose a different
-output root for those cases. Symbolic-link hash databases are also rejected.
+output root for those cases. Symbolic-link SQLite databases are also rejected.
 Date folders cannot redirect transfers outside their generated directory.
 Invalid paths and startup permission failures are reported without a traceback.
 The run is not transactional: a later transfer or database-save failure does
-not undo earlier successful moves. Dry-run creates no output directories,
-reports, or persistent files.
+not undo earlier successful moves. Dry-run creates no output directories, reports,
+database, or SQLite sidecars. It opens an existing database in immutable read-only
+mode and fails if a journal or WAL is present, because it cannot safely recover or
+read those files without writing.
 
 ### Similarity detection
 

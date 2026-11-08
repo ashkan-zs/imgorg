@@ -308,8 +308,7 @@ def test_similarity_only_scans_previous_archives_without_organization(tmp_path, 
         patch.object(organize_images, 'process_file', side_effect=AssertionError('processing')),
         patch.object(organize_images, 'calculate_hash', side_effect=AssertionError('SHA-256')),
         patch.object(organize_images, 'move_without_overwriting', side_effect=AssertionError('move')),
-        patch.object(organize_images, 'load_hash_file', side_effect=AssertionError('load database')),
-        patch.object(organize_images, 'save_hash_file', side_effect=AssertionError('save database')),
+        patch.object(organize_images, 'Persistence', side_effect=AssertionError('open database')),
     ):
         organize_images.main()
 

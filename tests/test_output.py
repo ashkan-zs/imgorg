@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
@@ -79,7 +80,7 @@ def test_output_layout_and_default_compatibility(tmp_path, location):
     assert (output / 'needs-review' / notes.name).read_bytes() == b'notes'
     assert (output / 'duplicate-files').is_dir()
     assert not (output / 'similar-images').exists()
-    assert (output / '.sha256_hashes.txt').is_file()
+    assert (output / organize_images.DATABASE_NAME).is_file()
     assert not photo.exists() and not notes.exists()
     assert 'Organized:    1' in result.stdout
     assert 'Needs review: 1' in result.stdout
@@ -155,7 +156,8 @@ def test_repeated_runs_and_sources_share_the_output_hash_database(tmp_path):
     assert 'Duplicates:   1' in repeated.stdout
     assert 'Duplicates:   1' in another.stdout
     assert 'Errors:       0' in repeated.stdout + another.stdout
-    assert (output / '.sha256_hashes.txt').read_text().splitlines() == [digest]
+    with sqlite3.connect(output / organize_images.DATABASE_NAME) as db:
+        assert db.execute('SELECT digest FROM exact_hashes').fetchall() == [(digest,)]
     assert (old_database.read_bytes(), old_database.stat().st_mtime_ns) == old_snapshot
     duplicates = output / 'duplicate-files' / DATE_DIRECTORY
     assert {path.name for path in duplicates.iterdir()} == {'copy.jpg', 'copy_1.jpg'}
@@ -331,7 +333,7 @@ def test_invalid_output_artifacts_are_rejected_before_moves(tmp_path, kind):
     elif kind == 'symlink':
         (output / 'organized-images').symlink_to(source, target_is_directory=True)
     else:
-        (output / '.sha256_hashes.txt').symlink_to(photo)
+        (output / organize_images.DATABASE_NAME).symlink_to(photo)
     result = subprocess.run(
         [sys.executable, str(SCRIPT), '--src', str(source), '--output', str(output)],
         capture_output=True, text=True,
@@ -360,11 +362,11 @@ def test_hash_database_save_failure_is_reported_gracefully(tmp_path, monkeypatch
     add_file(source / 'photo.jpg')
     output = tmp_path / 'sorted'
     monkeypatch.setattr(sys, 'argv', [str(SCRIPT), '--src', str(source), '--output', str(output)])
-    with patch.object(organize_images, 'save_hash_file', side_effect=PermissionError('permission denied')):
+    with patch.object(organize_images.Persistence, 'add_hashes', side_effect=sqlite3.OperationalError('permission denied')):
         with pytest.raises(SystemExit) as error:
             organize_images.main()
     assert error.value.code == 1
-    assert 'Cannot save hash database' in capsys.readouterr().err
+    assert 'SQLite persistence failure' in capsys.readouterr().err
 
 
 def test_custom_report_permission_failure_does_not_modify_archive(tmp_path, monkeypatch, caplog):
@@ -401,11 +403,11 @@ def test_unreadable_hash_database_stops_before_moves(tmp_path, monkeypatch, caps
     photo = add_file(source / 'photo.jpg')
     output = tmp_path / 'sorted'
     monkeypatch.setattr(sys, 'argv', [str(SCRIPT), '--src', str(source), '--output', str(output)])
-    with patch.object(organize_images, 'load_hash_file', side_effect=PermissionError('permission denied')):
+    with patch.object(organize_images.Persistence, 'hashes', side_effect=sqlite3.OperationalError('permission denied')):
         with pytest.raises(SystemExit) as error:
             organize_images.main()
     assert error.value.code == 1
-    assert 'Cannot read hash database' in capsys.readouterr().err
+    assert 'SQLite persistence failure' in capsys.readouterr().err
     assert photo.exists()
 
 
@@ -433,7 +435,9 @@ def test_date_directory_symlink_cannot_redirect_moves_into_source(tmp_path, dire
     date_directory.symlink_to(redirected, target_is_directory=True)
     if directory == 'duplicate-files':
         digest = hashlib.sha256(photo.read_bytes()).hexdigest()
-        add_file(output / '.sha256_hashes.txt', (digest + '\n').encode())
+        store = organize_images.Persistence(str(output))
+        store.add_hashes([digest])
+        store.close()
 
     result = run_cli(source, '--output', output, '--find-similar')
 
