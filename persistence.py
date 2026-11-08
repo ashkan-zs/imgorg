@@ -44,6 +44,11 @@ class Persistence:
                     source TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL CHECK(length(digest) = 64),
                     destination TEXT NOT NULL, category TEXT NOT NULL CHECK(category IN ('organized', 'review', 'duplicates')),
                     device INTEGER, inode INTEGER, CHECK((device IS NULL) = (inode IS NULL)))''')
+                self.connection.execute("""CREATE TABLE IF NOT EXISTS move_intents (
+                    source TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL CHECK(length(digest) = 64),
+                    destination TEXT NOT NULL, category TEXT NOT NULL CHECK(category IN ('organized', 'review', 'duplicates')),
+                    device INTEGER NOT NULL, inode INTEGER NOT NULL,
+                    state TEXT NOT NULL CHECK(state IN ('pending', 'complete')))""")
                 self.connection.execute('COMMIT')
             except BaseException:
                 self.connection.close()
@@ -87,3 +92,30 @@ class Persistence:
             digest=excluded.digest, destination=excluded.destination, category=excluded.category,
             device=excluded.device, inode=excluded.inode''',
             [(source, digest, destination, category, device, inode)])
+
+    def moves(self):
+        if self.connection is None:
+            return {}
+        return {source: (digest, destination, category, device, inode, state)
+                for source, digest, destination, category, device, inode, state in self.connection.execute(
+                    'SELECT source, digest, destination, category, device, inode, state FROM move_intents')}
+
+    def save_move_intent(self, source, digest, destination, category, identity):
+        self._transaction("""INSERT INTO move_intents(source, digest, destination, category, device, inode, state)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending') ON CONFLICT(source) DO UPDATE SET
+            digest=excluded.digest, destination=excluded.destination, category=excluded.category,
+            device=excluded.device, inode=excluded.inode, state='pending'""",
+            [(source, digest, destination, category, identity.st_dev, identity.st_ino)])
+
+    def finish_move(self, source, digest):
+        self.connection.execute('BEGIN IMMEDIATE')
+        try:
+            self.connection.execute('INSERT INTO exact_hashes(digest) VALUES (?) ON CONFLICT(digest) DO NOTHING', (digest,))
+            self.connection.execute("UPDATE move_intents SET state='complete' WHERE source=? AND digest=?", (source, digest))
+            if self.connection.execute('SELECT changes()').fetchone()[0] != 1:
+                raise sqlite3.IntegrityError('Move intent changed before completion')
+            self.connection.execute('COMMIT')
+        except BaseException:
+            if self.connection.in_transaction:
+                self.connection.execute('ROLLBACK')
+            raise

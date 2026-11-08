@@ -1,0 +1,171 @@
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+import organize_images as app
+from test_output import add_file, run_cli
+
+SCRIPT = Path(app.__file__)
+
+
+def interrupt(source, output, point):
+    script = '''
+import os, sys
+import organize_images as app
+point = sys.argv.pop()
+if point == 'after_intent':
+    app.os.link = lambda *args, **kwargs: os._exit(77)
+elif point == 'after_publish':
+    original = app.os.link
+    def publish(*args, **kwargs):
+        original(*args, **kwargs)
+        os._exit(77)
+    app.os.link = publish
+elif point == 'after_unlink':
+    original = app.os.unlink
+    def unlink(path, *args, **kwargs):
+        original(path, *args, **kwargs)
+        os._exit(77)
+    app.os.unlink = unlink
+app.main()
+'''
+    result = subprocess.run([sys.executable, '-c', script, '--src', str(source),
+                             '--output', str(output), point], capture_output=True)
+    assert result.returncode == 77, result.stderr
+
+
+@pytest.mark.parametrize('point', ['after_intent', 'after_publish', 'after_unlink'])
+def test_interruption_and_recovery_before_new_source(tmp_path, point):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'z.jpg', b'same')
+    interrupt(source, output, point)
+    add_file(source / 'a.jpg', b'same')
+    preview = run_cli(source, '--output', output, '--dry-run')
+    if point == 'after_intent':
+        assert 'Duplicates:   1' in preview.stdout  # both live sources match in memory
+    else:
+        assert 'Duplicates:   1' in preview.stdout
+    result = run_cli(source, '--output', output)
+    if point == 'after_intent':
+        assert len(list((output / 'organized-images').rglob('*.jpg'))) == 1
+    else:
+        assert len(list((output / 'organized-images').rglob('*.jpg'))) == 1
+        assert (output / 'organized-images').exists()
+        assert 'Duplicates:   1' in result.stdout
+    if point == 'after_publish':
+        assert original.exists()  # Ambiguous source is retained for review.
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT count(*) FROM exact_hashes').fetchone()[0] == 1
+
+
+def test_recovery_refuses_replaced_destination_and_preserves_source(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'z.jpg', b'original')
+    interrupt(source, output, 'after_publish')
+    destination = next((output / 'organized-images').rglob('z.jpg'))
+    replacement = add_file(tmp_path / 'replacement.jpg', b'original')
+    os.replace(replacement, destination)
+    before = destination.read_bytes()
+    result = run_cli(source, '--output', output, '--dry-run')
+    assert original.exists() and destination.read_bytes() == before
+    assert 'Unresolved move intent' in result.stderr
+
+
+def test_finish_move_database_failure_keeps_recoverable_intent(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    original = add_file(source / 'z.jpg', b'original')
+    output = tmp_path / 'output'
+    monkeypatch.setattr(sys, 'argv', [str(SCRIPT), '--src', str(source), '--output', str(output)])
+    with patch.object(app.Persistence, 'finish_move', side_effect=sqlite3.OperationalError('disk full')):
+        with pytest.raises(SystemExit):
+            app.main()
+    assert not original.exists()
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('pending',)
+    run_cli(source, '--output', output)
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('complete',)
+
+
+def test_multiple_pending_moves_recover_before_traversal(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    first = add_file(source / 'z.jpg', b'first')
+    interrupt(source, output, 'after_unlink')
+    second = add_file(source / 'y.jpg', b'second')
+    interrupt(source, output, 'after_unlink')
+    add_file(source / 'a.jpg', b'first')
+    add_file(source / 'b.jpg', b'second')
+    result = run_cli(source, '--output', output)
+    assert 'Duplicates:   2' in result.stdout
+    assert not first.exists() and not second.exists()
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute("SELECT count(*) FROM move_intents WHERE state='complete'").fetchone()[0] >= 2
+
+
+@pytest.mark.parametrize('damage', ['missing', 'modified'])
+def test_unverified_pending_destination_does_not_restore_hash(tmp_path, damage):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'z.jpg', b'original')
+    interrupt(source, output, 'after_publish')
+    destination = next((output / 'organized-images').rglob('z.jpg'))
+    if damage == 'missing':
+        destination.unlink()
+    else:
+        destination.write_bytes(b'corrupt')
+    add_file(source / 'a.jpg', b'original')
+    preview = run_cli(source, '--output', output, '--dry-run')
+    assert 'Unresolved move intent' in preview.stderr
+    assert original.exists()
+    if damage == 'modified':
+        assert destination.read_bytes() == b'corrupt'
+
+
+def test_recovery_is_idempotent(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    add_file(source / 'z.jpg', b'original')
+    interrupt(source, output, 'after_unlink')
+    run_cli(source, '--output', output)
+    first = (output / app.DATABASE_NAME).read_bytes()
+    run_cli(source, '--output', output)
+    assert (output / app.DATABASE_NAME).read_bytes() == first
+
+
+def test_two_pending_published_moves_recover_together(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    output = tmp_path / 'output'
+    output.mkdir(exist_ok=True)
+    store = app.Persistence(str(output))
+    for name, content in [('z.jpg', b'first'), ('y.jpg', b'second')]:
+        destination = add_file(output / 'organized-images' / '2024' / 'January' / name, content)
+        store.save_move_intent(str(source / name), app.calculate_hash(destination),
+                               str(destination.relative_to(output)), 'organized', destination.stat())
+    store.close()
+    add_file(source / 'a.jpg', b'first')
+    add_file(source / 'b.jpg', b'second')
+    result = run_cli(source, '--output', output)
+    assert 'Duplicates:   2' in result.stdout
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute("SELECT count(*) FROM move_intents WHERE state='complete'").fetchone()[0] >= 2
+
+
+def test_intent_commit_failure_prevents_publication(tmp_path, monkeypatch):
+    source = tmp_path / 'source'
+    original = add_file(source / 'photo.jpg', b'original')
+    output = tmp_path / 'output'
+    monkeypatch.setattr(sys, 'argv', [str(SCRIPT), '--src', str(source), '--output', str(output)])
+    with patch.object(app.Persistence, 'save_move_intent', side_effect=sqlite3.OperationalError('disk full')):
+        with pytest.raises(SystemExit):
+            app.main()
+    assert original.read_bytes() == b'original'
+    assert not list((output / 'organized-images').rglob('*.jpg'))

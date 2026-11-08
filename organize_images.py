@@ -111,14 +111,14 @@ def validate_destination_path(destination, root):
         raise OSError(f'Destination escapes generated output directory: {destination}')
 
 
-def move_to_duplicate_folder(path, date, expected_hash=None):
+def move_to_duplicate_folder(path, date, expected_hash=None, before_publish=None):
     duplicate_path = os.path.join(duplicate_dir, date)
     if not os.path.isdir(duplicate_path):
         os.makedirs(duplicate_path)
-    move_without_overwriting(path, duplicate_path, expected_hash=expected_hash)
+    move_without_overwriting(path, duplicate_path, expected_hash=expected_hash, before_publish=before_publish)
 
 
-def move_without_overwriting(source, destination_dir, expected_hash=None):
+def move_without_overwriting(source, destination_dir, expected_hash=None, before_publish=None):
     name = os.path.basename(source)
     stem, extension = os.path.splitext(name)
     suffix = 0
@@ -126,6 +126,11 @@ def move_without_overwriting(source, destination_dir, expected_hash=None):
     while True:
         candidate_name = name if suffix == 0 else f'{stem}_{suffix}{extension}'
         destination = os.path.join(destination_dir, candidate_name)
+        if before_publish is not None:
+            if os.path.lexists(destination):
+                suffix += 1
+                continue
+            before_publish(destination, os.stat(source, follow_symlinks=False))
         try:
             # A hard link creates the destination only if it does not exist.
             os.link(source, destination, follow_symlinks=False)
@@ -136,7 +141,7 @@ def move_without_overwriting(source, destination_dir, expected_hash=None):
             if err.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
                 raise
             if not os.path.islink(source):
-                return move_via_staging(source, destination_dir, expected_hash=expected_hash)
+                return move_via_staging(source, destination_dir, expected_hash=expected_hash, before_publish=before_publish)
             try:
                 os.symlink(os.readlink(source), destination)
             except FileExistsError:
@@ -169,7 +174,7 @@ def rename_without_overwriting(source, destination):
 
 
 
-def move_via_staging(source, destination_dir, expected_hash=None):
+def move_via_staging(source, destination_dir, expected_hash=None, before_publish=None):
     """Copy and verify before exclusive publication; retain the source until then."""
     def source_identity():
         status = os.stat(source, follow_symlinks=False)
@@ -200,6 +205,11 @@ def move_via_staging(source, destination_dir, expected_hash=None):
         while True:
             name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
             destination = os.path.join(destination_dir, name)
+            if before_publish is not None:
+                if os.path.lexists(destination):
+                    suffix += 1
+                    continue
+                before_publish(destination, os.stat(temporary))
             try:
                 try:
                     os.link(temporary, destination)
@@ -296,7 +306,73 @@ class CopyRecords:
                              'identity': None if identity is None else [device, inode]}
 
 
-def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None):
+
+class MoveRecords:
+    def __init__(self, output, store):
+        self.output = output
+        self.store = store
+        self.records = store.moves()
+
+    def verify(self, source, record):
+        digest, relative, category, device, inode, state = record
+        roots = {'organized': organized_images, 'review': need_review, 'duplicates': duplicate}
+        if category not in roots:
+            return None
+        destination = os.path.join(self.output, relative)
+        if not path_is_within(destination, os.path.join(self.output, roots[category])):
+            return None
+        if os.path.islink(destination) or not os.path.isfile(destination):
+            return None
+        status = os.stat(destination)
+        if (status.st_dev, status.st_ino) != (device, inode) or os.path.realpath(source) == os.path.realpath(destination):
+            return None
+        if calculate_hash(destination) != digest:
+            return None
+        return destination
+
+    def recover(self, dry_run):
+        verified_sources = {}
+        for source, record in self.records.items():
+            if record[5] == 'complete':
+                continue
+            try:
+                destination = self.verify(source, record)
+            except OSError as err:
+                log.warning('Cannot verify move intent for %s: %s', source, err)
+                continue
+            if destination is None:
+                log.warning('Unresolved move intent for %s: destination unverified', source)
+                continue
+            digest = record[0]
+            hash_keys.add(digest)
+            if os.path.exists(source):
+                try:
+                    if not os.path.islink(source) and calculate_hash(source) == digest:
+                        verified_sources[os.path.realpath(source)] = digest
+                except OSError as err:
+                    log.warning('Cannot verify move source %s: %s', source, err)
+            elif not dry_run:
+                self.store.finish_move(source, digest)
+            if not dry_run and os.path.exists(source):
+                self.store.add_hashes([digest])
+        return verified_sources
+
+    def remember(self, source, digest, destination, category, identity):
+        key = os.path.realpath(source)
+        relative = os.path.relpath(destination, self.output)
+        self.store.save_move_intent(key, digest, relative, category, identity)
+        self.records[key] = (digest, relative, category, identity.st_dev, identity.st_ino, 'pending')
+
+    def complete(self, source, digest):
+        key = os.path.realpath(source)
+        record = self.records[key]
+        if self.verify(key, record) is None:
+            raise OSError('Published move destination failed verification')
+        self.store.finish_move(key, digest)
+        self.records[key] = (*record[:5], 'complete')
+
+
+def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None, move_records=None):
     if stats is None:
         stats = {
             "organized": 0,
@@ -341,7 +417,10 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
             log.info("[DRY RUN] DUPLICATE: %s -> %s",
                      file_path, os.path.join(duplicate_dir, file_date))
         else:
-            move_to_duplicate_folder(file_path, file_date, expected_hash=file_hash)
+            move_to_duplicate_folder(file_path, file_date, expected_hash=file_hash,
+                    before_publish=lambda dest, identity: move_records.remember(file_path, file_hash, dest, 'duplicates', identity) if move_records else None)
+            if move_records is not None:
+                move_records.complete(file_path, file_hash)
 
         stats['duplicates'] += 1
         return
@@ -351,7 +430,10 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
         destination = file_path
     else:
         os.makedirs(destination_dir, exist_ok=True)
-        destination = move_without_overwriting(file_path, destination_dir, expected_hash=file_hash)
+        destination = move_without_overwriting(file_path, destination_dir, expected_hash=file_hash,
+            before_publish=lambda dest, identity: move_records.remember(file_path, file_hash, dest, category, identity) if move_records else None)
+        if move_records is not None:
+            move_records.complete(file_path, file_hash)
 
     hash_keys.add(file_hash)
 
@@ -361,7 +443,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     return destination
 
 
-def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None):
+def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None, move_records=None, recovered_sources=None):
     if copy_records is not None:
         for source, record in copy_records.records.items():
             if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
@@ -403,6 +485,10 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                 continue
 
             file_path = os.path.join(root, filename)
+            if recovered_sources and os.path.realpath(file_path) in recovered_sources:
+                if calculate_hash(file_path) == recovered_sources[os.path.realpath(file_path)]:
+                    log.warning('Move already published; source retained for review: %s', file_path)
+                    continue
 
             if os.path.islink(file_path):
                 log.warning("Skipping symbolic link: %s", file_path)
@@ -421,7 +507,7 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                     category = "review"
 
                 validate_destination_path(destination_dir, destination_root)
-                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records)
+                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records, move_records=move_records)
                 if similarity_paths is not None and destination is not None:
                     similarity_paths.append({
                         'path': destination,
@@ -573,8 +659,11 @@ def main():
         store = Persistence(output, dry_run=args.dry_run)
         hash_keys.update(store.hashes())
         copy_records = CopyRecords(output, store) if args.copy else None
+        move_records = None if args.copy else MoveRecords(output, store)
+        recovered_sources = None if args.copy else move_records.recover(args.dry_run)
         stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths,
-                           output=output, copy_records=copy_records)
+                           output=output, copy_records=copy_records, move_records=move_records,
+                           recovered_sources=recovered_sources)
         if not args.dry_run:
             store.add_hashes(hash_keys)
     except (OSError, sqlite3.Error) as err:

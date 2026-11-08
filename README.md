@@ -93,6 +93,15 @@ files are excluded from later scans and are not automatically removed. Relative
 paths are resolved against the working directory; `~`, `..`, and directory aliases
 are normalized.
 
+Move mode commits an intent before each destination publication. After publication,
+it verifies the destination and commits the SHA-256 hash with the completed state.
+On restart, pending destinations are checked by location, filesystem identity, and
+SHA-256 before their hashes affect new sources. If both source and verified
+destination exist, the source is retained for review. Unverified intents remain
+pending; they do not establish duplicate history. Filesystem publication and SQLite
+commits are separate, so this is process-interruption recovery rather than a
+power-loss durability guarantee.
+
 The SQLite database lives at `OUTPUT/.organize-image.sqlite3`, so repeat runs and
 different sources targeting the same output share that library's duplicate
 history. A database at a different source location is left untouched and is
