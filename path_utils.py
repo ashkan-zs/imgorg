@@ -60,3 +60,26 @@ def is_copy_staging(root, name, database_name):
         if parent == ancestor:
             return False
         ancestor = parent
+
+
+def same_directory_entry(first, second):
+    """Match aliases of one existing directory entry, not separate hard links."""
+    first = os.path.realpath(first)
+    second = os.path.realpath(second)
+    if not same_path(first, second):
+        return False
+    first_parent, first_name = os.path.split(first)
+    second_parent, second_name = os.path.split(second)
+    if not same_path(first_parent, second_parent):
+        return False
+    if first_name == second_name:
+        return True
+    if first_name.casefold() != second_name.casefold():
+        return False
+    # If two distinct spellings exist as directory entries, they may be
+    # separate hard links on a case-sensitive filesystem.
+    try:
+        names = os.listdir(first_parent)
+    except OSError:
+        return False
+    return sum(name.casefold() == first_name.casefold() for name in names) == 1

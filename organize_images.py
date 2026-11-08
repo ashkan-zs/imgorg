@@ -17,7 +17,7 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
-from path_utils import is_copy_staging, is_staging_name, path_is_within, same_path
+from path_utils import is_copy_staging, is_staging_name, path_is_within, same_directory_entry, same_path
 from persistence import DATABASE_NAME, DATABASE_FILES, Persistence, is_database_artifact
 
 
@@ -275,8 +275,15 @@ class CopyRecords:
         self.store = store
         self.records = store.records()
 
-    def previous(self, source, digest):
+    def source_key(self, source):
         key = os.path.realpath(source)
+        if key in self.records:
+            return key
+        return next((stored for stored in self.records
+                     if same_directory_entry(source, stored)), key)
+
+    def previous(self, source, digest):
+        key = self.source_key(source)
         record = self.records.get(key)
         if not isinstance(record, dict) or record.get('hash') != digest:
             return None
@@ -296,7 +303,7 @@ class CopyRecords:
         return destination, category
 
     def remember(self, source, digest, destination, category, identity=None):
-        key = os.path.realpath(source)
+        key = self.source_key(source)
         relative = os.path.relpath(destination, self.output)
         device = None if identity is None else identity.st_dev
         inode = None if identity is None else identity.st_ino

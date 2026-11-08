@@ -50,7 +50,10 @@ is reused on subsequent runs. A different source path with identical content is 
 copied into `duplicate-files`. Different content at an existing destination name is
 preserved and a numbered filename is selected. Changed sources or missing/modified
 recorded destinations are processed again using the current SHA-256 database. Renaming
-a source makes it a new source path. Keep the copy records with the output library.
+a source makes it a new source path. Existing source aliases that resolve to one
+directory entry reuse the same verified record; distinct hard-linked filenames remain
+separate sources. If the source has moved, its old record is not adopted by content
+alone. Keep the copy records with the output library.
 
 Summary counts classify processed source files, including reused copies; `ALREADY
 COPIED` messages identify reuse. New hashes are recorded only after successful copying
