@@ -47,7 +47,8 @@ def test_intents_are_committed_before_each_publication_attempt(tmp_path):
     def publish(src, dst):
         with sqlite3.connect(output / DATABASE_NAME) as other:
             row = other.execute('SELECT destination, device, inode FROM copy_intents').fetchone()
-        assert row == (os.path.relpath(dst, output), os.stat(src).st_dev, os.stat(src).st_ino)
+        assert row == (os.fsencode(os.path.relpath(dst, output)),
+                       'id:' + str(os.stat(src).st_dev), 'id:' + str(os.stat(src).st_ino))
         attempts.append(Path(dst).name)
         return real_link(src, dst)
 
@@ -76,7 +77,7 @@ app.main()
     assert result.returncode == 77
     with sqlite3.connect(output / DATABASE_NAME) as db:
         relative, = db.execute('SELECT destination FROM copy_intents').fetchone()
-    existing = add_file(output / relative, original.read_bytes())
+    existing = add_file(output / os.fsdecode(relative), original.read_bytes())
     result = run_cli(source, '--copy', '--output', output)
     assert 'ALREADY COPIED' not in result.stderr
     assert existing.read_bytes() == original.read_bytes()

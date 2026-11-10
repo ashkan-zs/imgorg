@@ -12,6 +12,20 @@ DATABASE_NAME = '.organize-image.sqlite3'
 DATABASE_FILES = tuple(DATABASE_NAME + suffix for suffix in ('', '-journal', '-wal', '-shm'))
 
 
+def encode_identity(value):
+    # INTEGER affinity would convert a plain large decimal string to lossy REAL.
+    # A prefix keeps decimal identities as TEXT even in existing INTEGER columns.
+    return None if value is None else 'id:' + str(value)
+
+
+def decode_identity(value):
+    if value is None or isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        return int(value[3:] if value.startswith('id:') else value)
+    raise sqlite3.DataError('Filesystem identity must be an integer or decimal TEXT')
+
+
 def validate_database_files(output):
     """Reject aliases that could let SQLite write through another directory entry."""
     for name in DATABASE_FILES:
@@ -36,6 +50,25 @@ def is_database_artifact(path, root, source, output):
 
 
 class Persistence:
+    def _path_key(self, table, column, path):
+        """Use filesystem bytes for new paths, retaining legacy TEXT primary keys.
+
+        Table/column names are internal constants; all path values are bound.
+        """
+        encoded = os.fsencode(path)
+        row = self.connection.execute(
+            f'SELECT {column} FROM {table} WHERE {column}=?', (encoded,)).fetchone()
+        if row is not None:
+            return row[0]
+        decoded = os.fsdecode(encoded)
+        try:
+            decoded.encode('utf-8')
+        except UnicodeEncodeError:
+            return encoded
+        row = self.connection.execute(
+            f'SELECT {column} FROM {table} WHERE {column}=?', (decoded,)).fetchone()
+        return row[0] if row is not None else encoded
+
     def __init__(self, output, dry_run=False):
         self.path = os.path.join(output, DATABASE_NAME)
         self.connection = None
@@ -102,8 +135,8 @@ class Persistence:
     def records(self):
         if self.connection is None:
             return {}
-        return {source: {'hash': digest, 'destination': destination, 'category': category,
-                         'identity': None if device is None else [device, inode]}
+        return {os.fsdecode(source): {'hash': digest, 'destination': os.fsdecode(destination), 'category': category,
+                         'identity': None if device is None else [decode_identity(device), decode_identity(inode)]}
                 for source, digest, destination, category, device, inode in self.connection.execute(
                     'SELECT source, digest, destination, category, device, inode FROM copy_intents')}
 
@@ -126,19 +159,21 @@ class Persistence:
             return None
         absolute = os.path.abspath(os.fspath(path))
         key = os.path.realpath(absolute)
+        key = self._path_key('file_cache', 'path', key)
         row = self.connection.execute(
             'SELECT device, inode, size, mtime_ns, ctime_ns, sha256 FROM file_cache WHERE path=?',
             (key,)).fetchone()
-        if row is None and key != absolute:
+        if row is None and os.fsdecode(key) != absolute:
             # Case and symlink aliases are not safely recognized by string
             # normalization. Resolve only on a miss, and keep hard links distinct.
             for stored_path, device, inode, size, mtime_ns, ctime_ns, digest in self.connection.execute(
                     'SELECT path, device, inode, size, mtime_ns, ctime_ns, sha256 FROM file_cache'):
-                if same_directory_entry(path, stored_path):
+                if same_directory_entry(path, os.fsdecode(stored_path)):
                     row = (device, inode, size, mtime_ns, ctime_ns, digest)
                     key = stored_path
                     break
-        digest = row[5] if row is not None and tuple(row[:5]) == signature else None
+        stored_signature = None if row is None else (decode_identity(row[0]), decode_identity(row[1]), *row[2:5])
+        digest = row[5] if stored_signature == signature else None
         if digest is not None and (
                 not isinstance(digest, str)
                 or re.fullmatch(r'[0-9a-fA-F]{64}', digest) is None):
@@ -149,36 +184,40 @@ class Persistence:
         if self.connection is None or not self.has_file_cache:
             return
         key = os.path.realpath(os.path.abspath(os.fspath(path)))
+        key = self._path_key('file_cache', 'path', key)
         self._transaction('''INSERT INTO file_cache(path, device, inode, size, mtime_ns, ctime_ns, sha256)
             VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET
             device=excluded.device, inode=excluded.inode, size=excluded.size,
             mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, sha256=excluded.sha256''',
-            [(key, *signature, digest)])
+            [(key, encode_identity(signature[0]), encode_identity(signature[1]), *signature[2:], digest)])
 
     def save_intent(self, source, digest, destination, category, device=None, inode=None):
+        source = self._path_key('copy_intents', 'source', source)
         self._transaction('''INSERT INTO copy_intents(source, digest, destination, category, device, inode)
             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(source) DO UPDATE SET
             digest=excluded.digest, destination=excluded.destination, category=excluded.category,
             device=excluded.device, inode=excluded.inode''',
-            [(source, digest, destination, category, device, inode)])
+            [(source, digest, os.fsencode(destination), category, encode_identity(device), encode_identity(inode))])
 
     def moves(self):
         if self.connection is None:
             return {}
-        return {source: (digest, destination, category, device, inode, state)
+        return {os.fsdecode(source): (digest, os.fsdecode(destination), category, decode_identity(device), decode_identity(inode), state)
                 for source, digest, destination, category, device, inode, state in self.connection.execute(
                     'SELECT source, digest, destination, category, device, inode, state FROM move_intents')}
 
     def save_move_intent(self, source, digest, destination, category, identity):
+        source = self._path_key('move_intents', 'source', source)
         self._transaction("""INSERT INTO move_intents(source, digest, destination, category, device, inode, state)
             VALUES (?, ?, ?, ?, ?, ?, 'pending') ON CONFLICT(source) DO UPDATE SET
             digest=excluded.digest, destination=excluded.destination, category=excluded.category,
             device=excluded.device, inode=excluded.inode, state='pending'""",
-            [(source, digest, destination, category, identity.st_dev, identity.st_ino)])
+            [(source, digest, os.fsencode(destination), category, encode_identity(identity.st_dev), encode_identity(identity.st_ino))])
 
     def finish_move(self, source, digest):
         self.connection.execute('BEGIN IMMEDIATE')
         try:
+            source = self._path_key('move_intents', 'source', source)
             self.connection.execute('INSERT INTO exact_hashes(digest) VALUES (?) ON CONFLICT(digest) DO NOTHING', (digest,))
             self.connection.execute("UPDATE move_intents SET state='complete' WHERE source=? AND digest=?", (source, digest))
             if self.connection.execute('SELECT changes()').fetchone()[0] != 1:
