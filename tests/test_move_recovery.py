@@ -64,6 +64,63 @@ def test_interruption_and_recovery_before_new_source(tmp_path, point):
         assert db.execute('SELECT count(*) FROM exact_hashes').fetchone()[0] == 1
 
 
+def test_copy_mode_recovers_move_unlinked_before_finalization(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    original = add_file(source / 'moved.jpg', b'identical bytes')
+    interrupt(source, output, 'after_unlink')
+    published = next((output / 'organized-images').rglob('moved.jpg'))
+    published_bytes = published.read_bytes()
+    incoming = add_file(source / 'incoming.jpg', b'identical bytes')
+
+    result = run_cli(source, '--copy', '--output', output)
+
+    assert 'Duplicates:   1' in result.stdout
+    assert not original.exists()
+    assert incoming.read_bytes() == b'identical bytes'
+    assert published.read_bytes() == published_bytes
+    duplicate = next((output / 'duplicate-files').rglob('incoming.jpg'))
+    assert duplicate.read_bytes() == b'identical bytes'
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('complete',)
+        assert db.execute('SELECT digest FROM exact_hashes').fetchone() == (app.calculate_hash(published),)
+
+
+def test_copy_mode_dry_run_does_not_finalize_pending_move(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    add_file(source / 'moved.jpg', b'original')
+    interrupt(source, output, 'after_unlink')
+    add_file(source / 'incoming.jpg', b'original')
+    database = output / app.DATABASE_NAME
+    before = database.read_bytes()
+
+    result = run_cli(source, '--copy', '--output', output, '--dry-run')
+
+    assert 'Duplicates:   1' in result.stdout
+    assert database.read_bytes() == before
+    with sqlite3.connect(database) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('pending',)
+
+
+def test_copy_mode_does_not_complete_unverified_pending_move(tmp_path):
+    source = tmp_path / 'source'
+    output = tmp_path / 'output'
+    add_file(source / 'moved.jpg', b'original')
+    interrupt(source, output, 'after_unlink')
+    destination = next((output / 'organized-images').rglob('moved.jpg'))
+    destination.write_bytes(b'corrupt')
+    incoming = add_file(source / 'incoming.jpg', b'original')
+
+    result = run_cli(source, '--copy', '--output', output)
+
+    assert 'Unresolved move intent' in result.stderr
+    assert incoming.read_bytes() == b'original'
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('pending',)
+    assert len(list((output / 'organized-images').rglob('incoming.jpg'))) == 1
+
+
 def test_recovery_refuses_replaced_destination_and_preserves_source(tmp_path):
     source = tmp_path / 'source'
     output = tmp_path / 'output'

@@ -334,12 +334,30 @@ class CopyRecords:
         self.output = output
         self.store = store
         self.records = store.records()
+        self.identity_index = {}
+        for source in self.records:
+            identity = self._source_identity(source)
+            if identity is not None:
+                self.identity_index.setdefault(identity, []).append(source)
+
+    @staticmethod
+    def _source_identity(source):
+        try:
+            status = os.stat(source, follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(status.st_mode):
+            return None
+        return status.st_dev, status.st_ino
 
     def source_key(self, source):
         key = os.path.realpath(source)
         if key in self.records:
             return key
-        return next((stored for stored in self.records
+        identity = self._source_identity(source)
+        if identity is None:
+            return key
+        return next((stored for stored in self.identity_index.get(identity, ())
                      if same_directory_entry(source, stored)), key)
 
     def previous(self, source, digest):
@@ -371,6 +389,11 @@ class CopyRecords:
         self.store.save_intent(key, digest, relative, category, device, inode)
         self.records[key] = {'hash': digest, 'destination': relative, 'category': category,
                              'identity': None if identity is None else [device, inode]}
+        source_identity = self._source_identity(source)
+        if source_identity is not None:
+            candidates = self.identity_index.setdefault(source_identity, [])
+            if key not in candidates:
+                candidates.append(key)
 
 
 
@@ -723,8 +746,9 @@ def main():
         store = Persistence(output, dry_run=args.dry_run)
         hash_keys.update(store.hashes())
         copy_records = CopyRecords(output, store) if args.copy else None
-        move_records = None if args.copy else MoveRecords(output, store)
-        recovered_sources = None if args.copy else move_records.recover(args.dry_run)
+        move_records = MoveRecords(output, store)
+        recovered_move_sources = move_records.recover(args.dry_run)
+        recovered_sources = None if args.copy else recovered_move_sources
         stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths,
                            output=output, copy_records=copy_records, move_records=move_records,
                            recovered_sources=recovered_sources, store=store)

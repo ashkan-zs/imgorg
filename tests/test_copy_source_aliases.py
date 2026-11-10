@@ -1,10 +1,12 @@
 import os
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 import organize_images as app
+from persistence import Persistence
 from test_output import add_file, run_cli, snapshot_files
 
 
@@ -94,6 +96,41 @@ def test_separate_outputs_have_separate_records(tmp_path):
         result = run_cli(source, '--copy', '--output', output)
         assert 'Organized:    1' in result.stdout
         assert len(records(output)) == 1
+
+
+def test_copy_source_alias_index_skips_unrelated_records(tmp_path):
+    output = tmp_path / 'output'
+    output.mkdir()
+    store = Persistence(str(output))
+    for index in range(40):
+        path = add_file(tmp_path / 'old' / f'{index}.jpg', str(index).encode())
+        store.save_intent(str(path), 'a' * 64, 'organized-images/old.jpg', 'organized')
+    aliases = app.CopyRecords(str(output), store)
+
+    with patch.object(app, 'same_directory_entry', wraps=app.same_directory_entry) as compare:
+        for index in range(30):
+            fresh = add_file(tmp_path / 'new' / f'{index}.jpg', str(index).encode())
+            assert aliases.source_key(str(fresh)) == os.path.realpath(fresh)
+        assert compare.call_count == 0
+    store.close()
+
+
+def test_copy_source_alias_index_keeps_exact_and_stale_path_behavior(tmp_path):
+    output = tmp_path / 'output'
+    output.mkdir()
+    source = add_file(tmp_path / 'source' / 'photo.jpg', b'photo')
+    missing = tmp_path / 'source' / 'deleted.jpg'
+    store = Persistence(str(output))
+    store.save_intent(str(source), 'a' * 64, 'organized-images/photo.jpg', 'organized')
+    store.save_intent(str(missing), 'b' * 64, 'organized-images/deleted.jpg', 'organized')
+    records = app.CopyRecords(str(output), store)
+    with patch.object(app, 'same_directory_entry', wraps=app.same_directory_entry) as compare:
+        assert records.source_key(source) == os.path.realpath(source)
+        new_path = add_file(tmp_path / 'source' / 'new.jpg', b'new')
+        assert records.source_key(new_path) == os.path.realpath(new_path)
+        # The missing record has no reliable current filesystem identity.
+        assert compare.call_count == 0
+    store.close()
 
 
 def test_alias_does_not_reuse_replaced_destination(tmp_path):
