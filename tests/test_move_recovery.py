@@ -13,6 +13,51 @@ from test_output import add_file, run_cli
 SCRIPT = Path(app.__file__)
 
 
+@pytest.mark.parametrize('alias_type', ['original', 'case', 'symlink'])
+@pytest.mark.parametrize('mode', ['move', 'dry-run', 'copy'])
+def test_retained_move_source_survives_restart_alias(tmp_path, alias_type, mode):
+    source = tmp_path / 'photos'
+    original = add_file(source / 'photo.jpg', b'retained contents')
+    output = tmp_path / 'output'
+    interrupt(source, output, 'after_publish')
+    destination = next((output / 'organized-images').rglob('photo.jpg'))
+    alias = source
+    if alias_type == 'case':
+        alias = tmp_path / 'PHOTOS'
+        if not alias.exists():
+            pytest.skip('Temporary filesystem is case-sensitive')
+    elif alias_type == 'symlink':
+        alias = tmp_path / 'alias'
+        alias.symlink_to(source, target_is_directory=True)
+    before = (output / app.DATABASE_NAME).read_bytes()
+    args = {'move': [], 'dry-run': ['--dry-run'], 'copy': ['--copy']}[mode]
+    run_cli(alias, '--output', output, *args)
+    assert original.read_bytes() == b'retained contents'
+    assert destination.read_bytes() == b'retained contents'
+    if mode != 'copy':
+        assert not list((output / 'duplicate-files').rglob('*.jpg'))
+    if mode == 'dry-run':
+        assert (output / app.DATABASE_NAME).read_bytes() == before
+    with sqlite3.connect(output / app.DATABASE_NAME) as db:
+        assert db.execute('SELECT state FROM move_intents').fetchone() == ('pending',)
+
+
+def test_recovered_source_guard_does_not_suppress_distinct_hardlink(tmp_path):
+    source = tmp_path / 'photos'
+    retained = add_file(source / 'a.jpg', b'contents')
+    output = tmp_path / 'output'
+    interrupt(source, output, 'after_publish')
+    other = source / 'b.jpg'
+    os.link(retained, other)
+    run_cli(source, '--output', output)
+    assert retained.read_bytes() == b'contents'
+    assert not other.exists()
+    duplicates = list((output / 'duplicate-files').rglob('*.jpg'))
+    assert len(duplicates) == 1
+    assert duplicates[0].name == 'b.jpg'
+    assert duplicates[0].read_bytes() == b'contents'
+
+
 def interrupt(source, output, point):
     script = '''
 import os, sys

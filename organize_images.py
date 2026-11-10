@@ -414,7 +414,7 @@ class MoveRecords:
         if os.path.islink(destination) or not os.path.isfile(destination):
             return None
         status = os.stat(destination)
-        if (status.st_dev, status.st_ino) != (device, inode) or os.path.realpath(source) == os.path.realpath(destination):
+        if (status.st_dev, status.st_ino) != (device, inode) or same_directory_entry(source, destination):
             return None
         if calculate_hash(destination) != digest:
             return None
@@ -575,8 +575,10 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                 continue
 
             file_path = os.path.join(root, filename)
-            if recovered_sources and os.path.realpath(file_path) in recovered_sources:
-                if calculate_hash(file_path) == recovered_sources[os.path.realpath(file_path)]:
+            recovered_digest = next((digest for source, digest in (recovered_sources or {}).items()
+                                     if same_directory_entry(file_path, source)), None)
+            if recovered_digest is not None:
+                if calculate_hash(file_path) == recovered_digest:
                     log.warning('Move already published; source retained for review: %s', file_path)
                     continue
 
