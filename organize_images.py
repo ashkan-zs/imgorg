@@ -69,6 +69,37 @@ def calculate_hash(file_path):
         return sha256.hexdigest()
 
 
+def file_signature(file_path):
+    """Return the cache signature for a regular, non-symlink file."""
+    status = os.stat(file_path, follow_symlinks=False)
+    if not stat.S_ISREG(status.st_mode):
+        raise OSError(f'Not a regular file: {file_path}')
+    return (status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns)
+
+
+def calculate_cached_hash(file_path, store, dry_run=False):
+    """Use a stat-signature cache; only cache a digest from a stable read.
+
+    The signature is a practical invalidation heuristic, not proof that bytes
+    are unchanged. Operation destination verification continues to hash bytes.
+    """
+    if os.path.islink(file_path):
+        raise OSError(f'Symbolic links are excluded: {file_path}')
+    before = file_signature(file_path)
+    if store is not None:
+        digest = store.cached_hash(file_path, before)
+        if digest is not None:
+            return digest
+    digest = calculate_hash(file_path)
+    after = file_signature(file_path)
+    if before != after:
+        raise OSError(f'File changed while hashing: {file_path}')
+    if store is not None and not dry_run:
+        store.save_cached_hash(file_path, before, digest)
+    return digest
+
+
 def get_image_date(file_path):
     extension = os.path.splitext(file_path)[1].lower()
 
@@ -408,7 +439,7 @@ class MoveRecords:
         self.records[key] = (*record[:5], 'complete')
 
 
-def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None, move_records=None):
+def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None, move_records=None, store=None):
     if stats is None:
         stats = {
             "organized": 0,
@@ -417,7 +448,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
             "errors": 0,
         }
 
-    file_hash = calculate_hash(file_path)
+    file_hash = calculate_cached_hash(file_path, store, dry_run)
 
     if copy_records is not None:
         previous = copy_records.previous(file_path, file_hash)
@@ -479,7 +510,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     return destination
 
 
-def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None, move_records=None, recovered_sources=None):
+def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None, move_records=None, recovered_sources=None, store=None):
     if copy_records is not None:
         for source, record in copy_records.records.items():
             if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
@@ -543,7 +574,7 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                     category = "review"
 
                 validate_destination_path(destination_dir, destination_root)
-                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records, move_records=move_records)
+                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records, move_records=move_records, store=store)
                 if similarity_paths is not None and destination is not None:
                     similarity_paths.append({
                         'path': destination,
@@ -696,7 +727,7 @@ def main():
         recovered_sources = None if args.copy else move_records.recover(args.dry_run)
         stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths,
                            output=output, copy_records=copy_records, move_records=move_records,
-                           recovered_sources=recovered_sources)
+                           recovered_sources=recovered_sources, store=store)
         if not args.dry_run:
             store.add_hashes(hash_keys)
     except (OSError, sqlite3.Error, ValueError) as err:

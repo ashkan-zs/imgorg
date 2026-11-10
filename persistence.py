@@ -1,11 +1,12 @@
 """Output-scoped SQLite storage for exact hashes and copy intents."""
 
 import os
+import re
 import sqlite3
 import stat
 from pathlib import Path
 
-from path_utils import same_path
+from path_utils import same_directory_entry, same_path
 
 DATABASE_NAME = '.organize-image.sqlite3'
 DATABASE_FILES = tuple(DATABASE_NAME + suffix for suffix in ('', '-journal', '-wal', '-shm'))
@@ -38,6 +39,7 @@ class Persistence:
     def __init__(self, output, dry_run=False):
         self.path = os.path.join(output, DATABASE_NAME)
         self.connection = None
+        self.has_file_cache = False
         validate_database_files(output)
         if dry_run and not os.path.exists(self.path):
             return
@@ -48,6 +50,12 @@ class Persistence:
                 raise sqlite3.OperationalError('Cannot read database with a pending journal or WAL in dry-run')
             uri = Path(self.path).absolute().as_uri() + '?mode=ro&immutable=1'
             self.connection = sqlite3.connect(uri, uri=True)
+            # Older databases are intentionally not upgraded in immutable mode.
+            # Querying sqlite_master distinguishes that case from unrelated SQL
+            # errors, which must still propagate.
+            self.has_file_cache = self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='file_cache'"
+            ).fetchone() is not None
         else:
             validate_database_files(output)
             self.connection = sqlite3.connect(self.path, isolation_level=None)
@@ -65,6 +73,11 @@ class Persistence:
                     source TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL CHECK(length(digest) = 64),
                     destination TEXT NOT NULL, category TEXT NOT NULL CHECK(category IN ('organized', 'review', 'duplicates')),
                     device INTEGER, inode INTEGER, CHECK((device IS NULL) = (inode IS NULL)))''')
+                self.connection.execute('''CREATE TABLE IF NOT EXISTS file_cache (
+                    path TEXT PRIMARY KEY NOT NULL, device INTEGER NOT NULL, inode INTEGER NOT NULL,
+                    size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
+                    sha256 TEXT NOT NULL CHECK(length(sha256) = 64))''')
+                self.has_file_cache = True
                 self.connection.execute("""CREATE TABLE IF NOT EXISTS move_intents (
                     source TEXT PRIMARY KEY NOT NULL, digest TEXT NOT NULL CHECK(length(digest) = 64),
                     destination TEXT NOT NULL, category TEXT NOT NULL CHECK(category IN ('organized', 'review', 'duplicates')),
@@ -106,6 +119,41 @@ class Persistence:
 
     def add_hashes(self, digests):
         self._transaction('INSERT INTO exact_hashes(digest) VALUES (?) ON CONFLICT(digest) DO NOTHING', ((digest,) for digest in digests))
+
+    def cached_hash(self, path, signature):
+        """Return a matching per-file digest, honoring filesystem path aliases."""
+        if self.connection is None or not self.has_file_cache:
+            return None
+        absolute = os.path.abspath(os.fspath(path))
+        key = os.path.realpath(absolute)
+        row = self.connection.execute(
+            'SELECT device, inode, size, mtime_ns, ctime_ns, sha256 FROM file_cache WHERE path=?',
+            (key,)).fetchone()
+        if row is None and key != absolute:
+            # Case and symlink aliases are not safely recognized by string
+            # normalization. Resolve only on a miss, and keep hard links distinct.
+            for stored_path, device, inode, size, mtime_ns, ctime_ns, digest in self.connection.execute(
+                    'SELECT path, device, inode, size, mtime_ns, ctime_ns, sha256 FROM file_cache'):
+                if same_directory_entry(path, stored_path):
+                    row = (device, inode, size, mtime_ns, ctime_ns, digest)
+                    key = stored_path
+                    break
+        digest = row[5] if row is not None and tuple(row[:5]) == signature else None
+        if digest is not None and (
+                not isinstance(digest, str)
+                or re.fullmatch(r'[0-9a-fA-F]{64}', digest) is None):
+            return None
+        return digest
+
+    def save_cached_hash(self, path, signature, digest):
+        if self.connection is None or not self.has_file_cache:
+            return
+        key = os.path.realpath(os.path.abspath(os.fspath(path)))
+        self._transaction('''INSERT INTO file_cache(path, device, inode, size, mtime_ns, ctime_ns, sha256)
+            VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET
+            device=excluded.device, inode=excluded.inode, size=excluded.size,
+            mtime_ns=excluded.mtime_ns, ctime_ns=excluded.ctime_ns, sha256=excluded.sha256''',
+            [(key, *signature, digest)])
 
     def save_intent(self, source, digest, destination, category, device=None, inode=None):
         self._transaction('''INSERT INTO copy_intents(source, digest, destination, category, device, inode)
