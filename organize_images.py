@@ -7,7 +7,8 @@ import logging as log
 import os
 import shutil
 import time
-import json
+import sqlite3
+import stat
 import tempfile
 import ctypes
 import sys
@@ -16,7 +17,8 @@ from PIL import Image, UnidentifiedImageError
 from PIL.ExifTags import Base, IFD
 from pillow_heif import register_heif_opener
 
-from path_utils import is_staging_name, path_is_within, same_path
+from path_utils import is_copy_staging, is_staging_name, path_is_within, same_directory_entry, same_path
+from persistence import DATABASE_NAME, Persistence, is_database_artifact, validate_database_files
 
 
 register_heif_opener()
@@ -49,26 +51,6 @@ ignore_files = ['.gitignore', '.sha256_hashes.txt']
 # File for saving hashes
 hash_keys = set()
 
-def load_hash_file():
-    try:
-        with open(data_file, 'r') as file:
-            for line in file:
-                file_hash = line.strip()
-
-                # SHA-256 hashes have 64 hex characters
-                if len(file_hash) == 64:
-                    hash_keys.add(file_hash)
-
-    except FileNotFoundError:
-        pass
-
-
-def save_hash_file():
-    with open(data_file, 'w') as file:
-        for file_hash in sorted(hash_keys):
-            file.write(f'{file_hash}\n')
-
-
 def should_organized(file_name):
     splits = file_name.split('.')
 
@@ -85,6 +67,37 @@ def calculate_hash(file_path):
             sha256.update(chunk)
 
         return sha256.hexdigest()
+
+
+def file_signature(file_path):
+    """Return the cache signature for a regular, non-symlink file."""
+    status = os.stat(file_path, follow_symlinks=False)
+    if not stat.S_ISREG(status.st_mode):
+        raise OSError(f'Not a regular file: {file_path}')
+    return (status.st_dev, status.st_ino, status.st_size,
+            status.st_mtime_ns, status.st_ctime_ns)
+
+
+def calculate_cached_hash(file_path, store, dry_run=False):
+    """Use a stat-signature cache; only cache a digest from a stable read.
+
+    The signature is a practical invalidation heuristic, not proof that bytes
+    are unchanged. Operation destination verification continues to hash bytes.
+    """
+    if os.path.islink(file_path):
+        raise OSError(f'Symbolic links are excluded: {file_path}')
+    before = file_signature(file_path)
+    if store is not None:
+        digest = store.cached_hash(file_path, before)
+        if digest is not None:
+            return digest
+    digest = calculate_hash(file_path)
+    after = file_signature(file_path)
+    if before != after:
+        raise OSError(f'File changed while hashing: {file_path}')
+    if store is not None and not dry_run:
+        store.save_cached_hash(file_path, before, digest)
+    return digest
 
 
 def get_image_date(file_path):
@@ -129,14 +142,14 @@ def validate_destination_path(destination, root):
         raise OSError(f'Destination escapes generated output directory: {destination}')
 
 
-def move_to_duplicate_folder(path, date):
+def move_to_duplicate_folder(path, date, expected_hash=None, before_publish=None):
     duplicate_path = os.path.join(duplicate_dir, date)
     if not os.path.isdir(duplicate_path):
         os.makedirs(duplicate_path)
-    move_without_overwriting(path, duplicate_path)
+    move_without_overwriting(path, duplicate_path, expected_hash=expected_hash, before_publish=before_publish)
 
 
-def move_without_overwriting(source, destination_dir):
+def move_without_overwriting(source, destination_dir, expected_hash=None, before_publish=None):
     name = os.path.basename(source)
     stem, extension = os.path.splitext(name)
     suffix = 0
@@ -144,6 +157,12 @@ def move_without_overwriting(source, destination_dir):
     while True:
         candidate_name = name if suffix == 0 else f'{stem}_{suffix}{extension}'
         destination = os.path.join(destination_dir, candidate_name)
+        source_status = os.stat(source, follow_symlinks=False)
+        if before_publish is not None:
+            if os.path.lexists(destination):
+                suffix += 1
+                continue
+            before_publish(destination, source_status)
         try:
             # A hard link creates the destination only if it does not exist.
             os.link(source, destination, follow_symlinks=False)
@@ -153,30 +172,29 @@ def move_without_overwriting(source, destination_dir):
         except OSError as err:
             if err.errno not in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP):
                 raise
+            if not os.path.islink(source):
+                return move_via_staging(source, destination_dir, expected_hash=expected_hash, before_publish=before_publish)
             try:
-                if os.path.islink(source):
-                    os.symlink(os.readlink(source), destination)
-                else:
-                    with open(source, 'rb') as source_file:
-                        with open(destination, 'xb') as destination_file:
-                            shutil.copyfileobj(source_file, destination_file)
-                    shutil.copystat(source, destination)
+                os.symlink(os.readlink(source), destination)
             except FileExistsError:
                 suffix += 1
                 continue
-            except Exception:
-                if os.path.lexists(destination):
-                    os.unlink(destination)
-                raise
 
-        try:
-            os.unlink(source)
-        except OSError:
-            try:
-                os.unlink(destination)
-            except OSError:
-                log.exception("Failed to roll back destination: %s", destination)
-            raise
+        # The source pathname may have been replaced after link(). Refuse to
+        # remove it unless both entries still name the inode we published.
+        # Python has no atomic identity-conditional unlink: a replacement in
+        # the short interval after these checks still requires external locking.
+        if expected_hash is not None and calculate_hash(destination) != expected_hash:
+            raise OSError('Published move destination failed hash verification')
+        source_now = os.stat(source, follow_symlinks=False)
+        destination_now = os.stat(destination, follow_symlinks=False)
+        original = (source_status.st_dev, source_status.st_ino)
+        if ((source_now.st_dev, source_now.st_ino) != original
+                or (destination_now.st_dev, destination_now.st_ino) != original):
+            raise OSError('Move source or published destination changed before removal')
+        # Keep a complete destination if source removal fails. Removing it here
+        # could delete a different file if the destination was replaced meanwhile.
+        os.unlink(source)
         return destination
 
 
@@ -199,13 +217,84 @@ def rename_without_overwriting(source, destination):
         raise OSError(error, os.strerror(error), destination)
 
 
+
+def move_via_staging(source, destination_dir, expected_hash=None, before_publish=None):
+    """Copy and verify before exclusive publication; retain the source until then."""
+    def source_identity():
+        status = os.stat(source, follow_symlinks=False)
+        if not stat.S_ISREG(status.st_mode):
+            raise OSError(f'Move source must be a regular file: {source}')
+        return (status.st_dev, status.st_ino, status.st_size,
+                status.st_mtime_ns, status.st_ctime_ns)
+
+    identity = source_identity()
+    if expected_hash is None:
+        expected_hash = calculate_hash(source)
+    descriptor, temporary = tempfile.mkstemp(prefix='.copy-', dir=destination_dir)
+    try:
+        status = os.fstat(descriptor)
+        temporary_identity = (status.st_dev, status.st_ino)
+    finally:
+        os.close(descriptor)
+    try:
+        shutil.copy2(source, temporary)
+        status = os.stat(temporary, follow_symlinks=False)
+        if (status.st_dev, status.st_ino) != temporary_identity:
+            raise OSError('Staged file was replaced during copying')
+        if calculate_hash(temporary) != expected_hash or source_identity() != identity:
+            raise OSError('Source changed during copying')
+
+        stem, extension = os.path.splitext(os.path.basename(source))
+        suffix = 0
+        while True:
+            name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
+            destination = os.path.join(destination_dir, name)
+            if before_publish is not None:
+                if os.path.lexists(destination):
+                    suffix += 1
+                    continue
+                before_publish(destination, os.stat(temporary))
+            try:
+                try:
+                    os.link(temporary, destination)
+                except OSError as err:
+                    if err.errno not in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS, errno.EXDEV):
+                        raise
+                    rename_without_overwriting(temporary, destination)
+                break
+            except FileExistsError:
+                suffix += 1
+
+        # A failed unlink must never remove a destination that another process
+        # may have replaced. A complete extra copy is safer than deleting it.
+        if source_identity() != identity:
+            raise OSError('Source changed before removal')
+        os.unlink(source)
+        return destination
+    finally:
+        try:
+            status = os.stat(temporary, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if (status.st_dev, status.st_ino) == temporary_identity:
+                os.unlink(temporary)
+
+
 def copy_without_overwriting(source, destination_dir, expected_hash=None, before_publish=None):
     if os.path.islink(source) or not os.path.isfile(source):
         raise OSError(f'Copy source must be a regular file: {source}')
     descriptor, temporary = tempfile.mkstemp(prefix='.copy-', dir=destination_dir)
-    os.close(descriptor)
+    try:
+        status = os.fstat(descriptor)
+        temporary_identity = (status.st_dev, status.st_ino)
+    finally:
+        os.close(descriptor)
     try:
         shutil.copy2(source, temporary)
+        status = os.stat(temporary, follow_symlinks=False)
+        if (status.st_dev, status.st_ino) != temporary_identity:
+            raise OSError('Staged file was replaced during copying')
         if expected_hash is not None and calculate_hash(temporary) != expected_hash:
             raise OSError('Source changed during copying')
         stem, extension = os.path.splitext(os.path.basename(source))
@@ -213,8 +302,11 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
         while True:
             name = f'{stem}_{suffix}{extension}' if suffix else f'{stem}{extension}'
             destination = os.path.join(destination_dir, name)
+            status = os.stat(temporary, follow_symlinks=False)
+            if (status.st_dev, status.st_ino) != temporary_identity:
+                raise OSError('Staged file was replaced before publication')
             if before_publish is not None:
-                before_publish(destination, os.stat(temporary))
+                before_publish(destination, status)
             try:
                 # Publish the completed temporary inode exclusively, never the source inode.
                 try:
@@ -227,24 +319,49 @@ def copy_without_overwriting(source, destination_dir, expected_hash=None, before
             except FileExistsError:
                 suffix += 1
     finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+        try:
+            status = os.stat(temporary, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            # An identity check narrows, but cannot close, the stat/unlink race.
+            if (status.st_dev, status.st_ino) == temporary_identity:
+                os.unlink(temporary)
 
 
 class CopyRecords:
-    def __init__(self, output):
+    def __init__(self, output, store):
         self.output = output
-        self.path = os.path.join(output, '.copy_records.json')
+        self.store = store
+        self.records = store.records()
+        self.identity_index = {}
+        for source in self.records:
+            identity = self._source_identity(source)
+            if identity is not None:
+                self.identity_index.setdefault(identity, []).append(source)
+
+    @staticmethod
+    def _source_identity(source):
         try:
-            with open(self.path) as file:
-                self.records = json.load(file)
-            if not isinstance(self.records, dict):
-                raise ValueError('Copy records must be an object')
-        except FileNotFoundError:
-            self.records = {}
+            status = os.stat(source, follow_symlinks=False)
+        except OSError:
+            return None
+        if not stat.S_ISREG(status.st_mode):
+            return None
+        return status.st_dev, status.st_ino
+
+    def source_key(self, source):
+        key = os.path.realpath(source)
+        if key in self.records:
+            return key
+        identity = self._source_identity(source)
+        if identity is None:
+            return key
+        return next((stored for stored in self.identity_index.get(identity, ())
+                     if same_directory_entry(source, stored)), key)
 
     def previous(self, source, digest):
-        key = os.path.realpath(source)
+        key = self.source_key(source)
         record = self.records.get(key)
         if not isinstance(record, dict) or record.get('hash') != digest:
             return None
@@ -264,26 +381,88 @@ class CopyRecords:
         return destination, category
 
     def remember(self, source, digest, destination, category, identity=None):
-        records = dict(self.records)
-        records[os.path.realpath(source)] = {
-            'hash': digest, 'destination': os.path.relpath(destination, self.output),
-            'category': category,
-        }
-        if identity is not None:
-            records[os.path.realpath(source)]['identity'] = [identity.st_dev, identity.st_ino]
-        descriptor, temporary = tempfile.mkstemp(prefix='.copy-records-', dir=self.output)
-        try:
-            with os.fdopen(descriptor, 'w') as file:
-                json.dump(records, file, indent=2)
-                file.write('\n')
-            os.replace(temporary, self.path)
-            self.records = records
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        key = self.source_key(source)
+        relative = os.path.relpath(destination, self.output)
+        device = None if identity is None else identity.st_dev
+        inode = None if identity is None else identity.st_ino
+        # Commit the intent before attempting exclusive filesystem publication.
+        self.store.save_intent(key, digest, relative, category, device, inode)
+        self.records[key] = {'hash': digest, 'destination': relative, 'category': category,
+                             'identity': None if identity is None else [device, inode]}
+        source_identity = self._source_identity(source)
+        if source_identity is not None:
+            candidates = self.identity_index.setdefault(source_identity, [])
+            if key not in candidates:
+                candidates.append(key)
 
 
-def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None):
+
+class MoveRecords:
+    def __init__(self, output, store):
+        self.output = output
+        self.store = store
+        self.records = store.moves()
+
+    def verify(self, source, record):
+        digest, relative, category, device, inode, state = record
+        roots = {'organized': organized_images, 'review': need_review, 'duplicates': duplicate}
+        if category not in roots:
+            return None
+        destination = os.path.join(self.output, relative)
+        if not path_is_within(destination, os.path.join(self.output, roots[category])):
+            return None
+        if os.path.islink(destination) or not os.path.isfile(destination):
+            return None
+        status = os.stat(destination)
+        if (status.st_dev, status.st_ino) != (device, inode) or same_directory_entry(source, destination):
+            return None
+        if calculate_hash(destination) != digest:
+            return None
+        return destination
+
+    def recover(self, dry_run):
+        verified_sources = {}
+        for source, record in self.records.items():
+            if record[5] == 'complete':
+                continue
+            try:
+                destination = self.verify(source, record)
+            except OSError as err:
+                log.warning('Cannot verify move intent for %s: %s', source, err)
+                continue
+            if destination is None:
+                log.warning('Unresolved move intent for %s: destination unverified', source)
+                continue
+            digest = record[0]
+            hash_keys.add(digest)
+            if os.path.exists(source):
+                try:
+                    if not os.path.islink(source) and calculate_hash(source) == digest:
+                        verified_sources[os.path.realpath(source)] = digest
+                except OSError as err:
+                    log.warning('Cannot verify move source %s: %s', source, err)
+            elif not dry_run:
+                self.store.finish_move(source, digest)
+            if not dry_run and os.path.exists(source):
+                self.store.add_hashes([digest])
+        return verified_sources
+
+    def remember(self, source, digest, destination, category, identity):
+        key = os.path.realpath(source)
+        relative = os.path.relpath(destination, self.output)
+        self.store.save_move_intent(key, digest, relative, category, identity)
+        self.records[key] = (digest, relative, category, identity.st_dev, identity.st_ino, 'pending')
+
+    def complete(self, source, digest):
+        key = os.path.realpath(source)
+        record = self.records[key]
+        if self.verify(key, record) is None:
+            raise OSError('Published move destination failed verification')
+        self.store.finish_move(key, digest)
+        self.records[key] = (*record[:5], 'complete')
+
+
+def process_file(file_path, destination_dir, file_date, stats=None, category=None, dry_run=False, copy_records=None, move_records=None, store=None):
     if stats is None:
         stats = {
             "organized": 0,
@@ -292,7 +471,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
             "errors": 0,
         }
 
-    file_hash = calculate_hash(file_path)
+    file_hash = calculate_cached_hash(file_path, store, dry_run)
 
     if copy_records is not None:
         previous = copy_records.previous(file_path, file_hash)
@@ -328,7 +507,10 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
             log.info("[DRY RUN] DUPLICATE: %s -> %s",
                      file_path, os.path.join(duplicate_dir, file_date))
         else:
-            move_to_duplicate_folder(file_path, file_date)
+            move_to_duplicate_folder(file_path, file_date, expected_hash=file_hash,
+                    before_publish=lambda dest, identity: move_records.remember(file_path, file_hash, dest, 'duplicates', identity) if move_records else None)
+            if move_records is not None:
+                move_records.complete(file_path, file_hash)
 
         stats['duplicates'] += 1
         return
@@ -338,7 +520,10 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
         destination = file_path
     else:
         os.makedirs(destination_dir, exist_ok=True)
-        destination = move_without_overwriting(file_path, destination_dir)
+        destination = move_without_overwriting(file_path, destination_dir, expected_hash=file_hash,
+            before_publish=lambda dest, identity: move_records.remember(file_path, file_hash, dest, category, identity) if move_records else None)
+        if move_records is not None:
+            move_records.complete(file_path, file_hash)
 
     hash_keys.add(file_hash)
 
@@ -348,8 +533,7 @@ def process_file(file_path, destination_dir, file_date, stats=None, category=Non
     return destination
 
 
-def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None):
-    load_hash_file()
+def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_records=None, move_records=None, recovered_sources=None, store=None):
     if copy_records is not None:
         for source, record in copy_records.records.items():
             if not isinstance(record, dict) or not isinstance(record.get('hash'), str):
@@ -379,14 +563,24 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
         )
 
         for filename in sorted(files):
-            if filename in ignore_files or (
+            if (is_copy_staging(root, filename, DATABASE_NAME)
+                or is_database_artifact(os.path.join(root, filename), root, path, output)
+                or filename in ignore_files
+                or (same_path(root, path) and filename == '.copy_records.json')
+                or (
                 same_path(root, output)
                 and (same_path(os.path.join(root, filename), os.path.join(output, '.copy_records.json'))
                      or is_staging_name(filename, ('.copy-records-', '.hashes-')))
-            ):
+                )):
                 continue
 
             file_path = os.path.join(root, filename)
+            recovered_digest = next((digest for source, digest in (recovered_sources or {}).items()
+                                     if same_directory_entry(file_path, source)), None)
+            if recovered_digest is not None:
+                if calculate_hash(file_path) == recovered_digest:
+                    log.warning('Move already published; source retained for review: %s', file_path)
+                    continue
 
             if os.path.islink(file_path):
                 log.warning("Skipping symbolic link: %s", file_path)
@@ -405,13 +599,15 @@ def file_dates(path, dry_run=False, similarity_paths=None, output=None, copy_rec
                     category = "review"
 
                 validate_destination_path(destination_dir, destination_root)
-                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records)
+                destination = process_file(file_path, destination_dir, image_date, stats=stats, category=category, dry_run=dry_run, copy_records=copy_records, move_records=move_records, store=store)
                 if similarity_paths is not None and destination is not None:
                     similarity_paths.append({
                         'path': destination,
                         'original_name': filename,
                     })
 
+            except sqlite3.Error:
+                raise
             except Exception as err:
                 stats["errors"] += 1
                 log.error("Failed to process %s: %s", file_path, err)
@@ -446,14 +642,12 @@ def validate_output_path(source, output, directories, check_database=True):
         if path_is_within(source, destination):
             raise ValueError(f'Source must not be inside a generated output directory: {destination}')
 
-    database = os.path.join(output, '.sha256_hashes.txt')
-    if check_database and os.path.lexists(database):
-        if os.path.islink(database) or not os.path.isfile(database):
-            raise ValueError(f'Hash database must be a regular file: {database}')
+    if check_database:
+        validate_database_files(output)
 
 
 def main():
-    global path, duplicate_dir, need_review_dir, data_file
+    global path, duplicate_dir, need_review_dir
 
     parser = argparse.ArgumentParser(
         description='This is a script for organizing photos by date'
@@ -540,15 +734,6 @@ def main():
 
     duplicate_dir = os.path.join(output, duplicate)
     need_review_dir = os.path.join(output, need_review)
-    data_file = os.path.join(output, '.sha256_hashes.txt')
-
-    copy_records = None
-    if args.copy:
-        try:
-            copy_records = CopyRecords(output)
-        except (OSError, ValueError) as err:
-            parser.error(f'Cannot read copy records: {err}')
-
     if not args.dry_run:
         try:
             os.makedirs(duplicate_dir, exist_ok=True)
@@ -556,28 +741,26 @@ def main():
         except OSError as err:
             parser.exit(1, f'error: Cannot prepare output directory: {err}\n')
 
+    store = None
     hash_keys.clear()
     similarity_paths = [] if args.find_similar else None
     try:
-        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths, output=output, copy_records=copy_records)
-    except OSError as err:
-        parser.exit(1, f'error: Cannot read hash database: {err}\n')
-
-    if not args.dry_run:
-        try:
-            if args.copy:
-                descriptor, temporary = tempfile.mkstemp(prefix='.hashes-', dir=output)
-                try:
-                    with os.fdopen(descriptor, 'w') as file:
-                        file.writelines(f'{digest}\n' for digest in sorted(hash_keys))
-                    os.replace(temporary, data_file)
-                finally:
-                    if os.path.exists(temporary):
-                        os.unlink(temporary)
-            else:
-                save_hash_file()
-        except OSError as err:
-            parser.exit(1, f'error: Cannot save hash database: {err}\n')
+        store = Persistence(output, dry_run=args.dry_run)
+        hash_keys.update(store.hashes())
+        copy_records = CopyRecords(output, store) if args.copy else None
+        move_records = MoveRecords(output, store)
+        recovered_move_sources = move_records.recover(args.dry_run)
+        recovered_sources = None if args.copy else recovered_move_sources
+        stats = file_dates(path, dry_run=args.dry_run, similarity_paths=similarity_paths,
+                           output=output, copy_records=copy_records, move_records=move_records,
+                           recovered_sources=recovered_sources, store=store)
+        if not args.dry_run:
+            store.add_hashes(hash_keys)
+    except (OSError, sqlite3.Error, ValueError) as err:
+        parser.exit(1, f'error: SQLite persistence failure: {err}\n')
+    finally:
+        if store is not None:
+            store.close()
 
     print_summary(stats, dry_run=args.dry_run)
 

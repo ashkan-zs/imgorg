@@ -14,6 +14,7 @@ import imagehash
 from PIL import Image, ImageOps
 
 from path_utils import is_staging_name, path_is_within, same_path
+from persistence import DATABASE_NAME, is_database_artifact
 
 
 REPORT_DIRECTORY = 'similar-images'
@@ -41,7 +42,7 @@ def scan_images(source, excluded_dirs=(), output=None):
             ancestor = os.path.realpath(root)
             staging = False
             while True:
-                if (os.path.isfile(os.path.join(ancestor, '.copy_records.json'))
+                if (os.path.isfile(os.path.join(ancestor, DATABASE_NAME))
                         or all(os.path.isdir(os.path.join(ancestor, directory))
                                for directory in ('duplicate-files', 'needs-review'))):
                     staging = (
@@ -58,7 +59,9 @@ def scan_images(source, excluded_dirs=(), output=None):
                 if parent == ancestor:
                     break
                 ancestor = parent
-            if (name not in SCAN_IGNORE_FILES
+            if (not is_database_artifact(path, root, source, output)
+                    and name not in SCAN_IGNORE_FILES
+                    and not (same_path(root, source) and name == '.copy_records.json')
                     and not (same_path(root, output)
                              and same_path(path, os.path.join(output, '.copy_records.json')))
                     and not staging

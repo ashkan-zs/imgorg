@@ -232,3 +232,37 @@ def test_copy_records_output_root_case_alias(tmp_path, case_insensitive):
     assert result.returncode == 0, result.stderr
     assert record.read_text() == '{}'
     assert (source / 'needs-review' / '.copy_records.json').read_text() == 'user content'
+
+
+@pytest.mark.parametrize('alias_type', ['symlink', 'case'])
+def test_source_database_artifacts_with_root_alias(tmp_path, case_sensitive, alias_type):
+    from persistence import DATABASE_FILES, Persistence
+    from test_output import add_file
+
+    if alias_type == 'case' and case_sensitive:
+        pytest.skip('Temporary filesystem is case-sensitive')
+    source = tmp_path / 'photos'
+    source.mkdir()
+    store = Persistence(str(source))
+    store.close()
+    for name in DATABASE_FILES[1:]:
+        add_file(source / name, name.encode())
+    protected = {source / name: (source / name).read_bytes() for name in DATABASE_FILES}
+    incoming = photo(source / 'incoming.png')
+    if alias_type == 'symlink':
+        alias = tmp_path / 'source-alias'
+        alias.symlink_to(source, target_is_directory=True)
+    else:
+        alias = tmp_path / 'PHOTOS'
+        for name in DATABASE_FILES:
+            (source / name).rename(source / name.upper())
+    output = tmp_path / 'output'
+
+    candidates = list(similarity.scan_images(alias, output=output))
+    assert len(candidates) == 1 and same_path(candidates[0]['path'], incoming)
+    result = run_cli(alias, output)
+    assert result.returncode == 0, result.stderr
+    assert 'Total:        1' in result.stdout
+    assert not incoming.exists()
+    assert all(path.read_bytes() == contents for path, contents in protected.items())
+    assert not any((output / 'needs-review' / name).exists() for name in DATABASE_FILES)

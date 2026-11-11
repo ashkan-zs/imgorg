@@ -1,4 +1,5 @@
 import errno
+import sqlite3
 import os
 import subprocess
 import sys
@@ -57,7 +58,7 @@ def test_partial_copy_failure_leaves_no_outputs_or_hashes(tmp_path, error):
     source = add_file(tmp_path / 'source.jpg')
     output = tmp_path / 'output'
     output.mkdir()
-    records = organizer.CopyRecords(str(output))
+    records = organizer.CopyRecords(str(output), organizer.Persistence(str(output)))
     stats = {'organized': 0, 'review': 0, 'duplicates': 0, 'errors': 0}
     def fail(src, dst):
         Path(dst).write_bytes(b'partial')
@@ -67,7 +68,8 @@ def test_partial_copy_failure_leaves_no_outputs_or_hashes(tmp_path, error):
         with pytest.raises(OSError):
             organizer.process_file(source, str(output), '2024/January', stats, 'organized', copy_records=records)
         assert not organizer.hash_keys
-    assert list(output.iterdir()) == []
+    assert {p.name for p in output.iterdir()} == {organizer.DATABASE_NAME}
+    records.store.close()
     assert source.read_bytes() == b'photo contents'
     assert stats['organized'] == 0
 
@@ -139,7 +141,7 @@ def test_failed_finalization_does_not_register_copy(tmp_path, failure):
     source = add_file(tmp_path / 'source.jpg')
     output = tmp_path / 'output'
     output.mkdir()
-    records = organizer.CopyRecords(str(output))
+    records = organizer.CopyRecords(str(output), organizer.Persistence(str(output)))
     stats = {'organized': 0, 'review': 0, 'duplicates': 0, 'errors': 0}
     target = patch.object(organizer.os, 'link', side_effect=PermissionError('denied')) if failure == 'publication' else patch.object(records, 'remember', side_effect=PermissionError('denied'))
     with patch.object(organizer, 'hash_keys', set()), target:
@@ -161,6 +163,26 @@ def test_copy_never_overwrites_existing_content(tmp_path):
     assert existing.read_bytes() == b'existing'
     assert destination.read_bytes() == b'new'
     assert source.read_bytes() == b'new'
+
+
+def test_copy_cleanup_preserves_replaced_staging_file(tmp_path):
+    source = add_file(tmp_path / 'photo.jpg', b'source')
+    output = tmp_path / 'output'
+    output.mkdir()
+    replacement = add_file(tmp_path / 'replacement', b'unrelated')
+    staged = []
+
+    def replace_and_fail(src, dst):
+        staged.append(Path(dst))
+        os.replace(replacement, dst)
+        raise OSError('copy failed')
+
+    with patch.object(organizer.shutil, 'copy2', side_effect=replace_and_fail):
+        with pytest.raises(OSError, match='copy failed'):
+            organizer.copy_without_overwriting(source, output)
+    assert source.read_bytes() == b'source'
+    assert staged[0].read_bytes() == b'unrelated'
+    assert not (output / 'photo.jpg').exists()
 
 
 def test_distinct_hardlinked_sources_remain_duplicates(tmp_path):
@@ -242,7 +264,8 @@ app.main()
     assert list((output / 'organized-images').rglob('photo*.jpg')) == [destination]
     assert not list((output / 'duplicate-files').rglob('*.jpg'))
     assert destination.read_bytes() == original.read_bytes()
-    assert organizer.calculate_hash(original) in (output / '.sha256_hashes.txt').read_text()
+    with sqlite3.connect(output / organizer.DATABASE_NAME) as db:
+        assert (organizer.calculate_hash(original),) in db.execute('SELECT digest FROM exact_hashes').fetchall()
 
 
 def test_unpublished_intent_cannot_adopt_existing_same_content(tmp_path):
@@ -250,7 +273,7 @@ def test_unpublished_intent_cannot_adopt_existing_same_content(tmp_path):
     output = tmp_path / 'output'
     existing = add_file(output / 'organized-images' / 'photo.jpg')
     temporary = add_file(output / 'staged', source.read_bytes())
-    records = organizer.CopyRecords(str(output))
+    records = organizer.CopyRecords(str(output), organizer.Persistence(str(output)))
     records.remember(source, organizer.calculate_hash(source), existing, 'organized', temporary.stat())
     assert records.previous(source, organizer.calculate_hash(source)) is None
     assert existing.read_bytes() == source.read_bytes()
@@ -260,7 +283,8 @@ def test_interrupted_staging_artifacts_are_not_inputs(tmp_path):
     import similarity
     source = tmp_path / 'source'
     original = add_file(source / 'photo.jpg')
-    add_file(source / '.copy_records.json', b'{}')
+    store = organizer.Persistence(str(source))
+    store.close()
     artifacts = [add_file(source / name) for name in ['.copy-records-abcdefgh', '.hashes-abcdefgh']]
     artifacts.append(add_file(source / 'organized-images' / '2024' / 'January' / '.copy-abcdefgh'))
     assert list(similarity.scan_images(str(source))) == [{'path': str(original), 'original_name': original.name}]
@@ -300,7 +324,8 @@ def test_recovery_hashes_are_loaded_before_new_sources(tmp_path):
     original = add_file(source / 'z.jpg')
     run_cli(source, '--copy', '--output', output)
     # Simulate termination after publication but before the hash database is saved.
-    (output / '.sha256_hashes.txt').unlink()
+    with sqlite3.connect(output / organizer.DATABASE_NAME) as db:
+        db.execute('DELETE FROM exact_hashes')
     duplicate = add_file(source / 'a.jpg', original.read_bytes())
     before = snapshot_files(output)
     preview = run_cli(source, '--copy', '--output', output, '--dry-run')
@@ -319,7 +344,8 @@ def test_recovery_does_not_restore_unverified_destinations(tmp_path, damage):
     output = tmp_path / 'output'
     original = add_file(source / 'z.jpg')
     run_cli(source, '--copy', '--output', output)
-    (output / '.sha256_hashes.txt').unlink()
+    with sqlite3.connect(output / organizer.DATABASE_NAME) as db:
+        db.execute('DELETE FROM exact_hashes')
     destination = next((output / 'organized-images').rglob('z.jpg'))
     if damage == 'missing':
         destination.unlink()
@@ -338,7 +364,8 @@ def test_recovery_restores_multiple_records_before_similarity(tmp_path):
     output = tmp_path / 'output'
     make_similar_photos(source)
     run_cli(source, '--copy', '--output', output)
-    (output / '.sha256_hashes.txt').unlink()
+    with sqlite3.connect(output / organizer.DATABASE_NAME) as db:
+        db.execute('DELETE FROM exact_hashes')
     add_file(source / 'a.jpg', (source / 'one' / 'photo.jpg').read_bytes())
     add_file(source / 'b.jpg', (source / 'two' / 'photo.jpg').read_bytes())
     result = run_cli(source, '--copy', '--output', output, '--find-similar')
@@ -362,14 +389,14 @@ def test_nested_copy_records_is_user_input(tmp_path, copy_mode):
     assert nested.exists() == copy_mode
     if copy_mode:
         assert nested.read_bytes() == b'user data'
-        assert (output / '.copy_records.json').read_bytes() != b'user data'
+        assert (output / organizer.DATABASE_NAME).exists()
 
 
 def test_output_root_records_excluded_but_unrelated_source_included(tmp_path):
     import similarity
     source = tmp_path / 'source'
     output = tmp_path / 'output'
-    incoming = add_file(source / '.copy_records.json', b'user data')
+    incoming = add_file(source / 'nested' / '.copy_records.json', b'user data')
     records = add_file(output / '.copy_records.json', b'{}')
     assert [Path(item['path']) for item in similarity.scan_images(source, output=output)] == [incoming]
     assert list(similarity.scan_images(output, output=output)) == []

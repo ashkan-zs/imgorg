@@ -42,7 +42,7 @@ Support depends on the filesystem/driver, including exFAT and network mounts; if
 neither primitive is supported, copying fails safely. Temporary files are removed
 on ordinary failures.
 
-`OUTPUT/.copy_records.json` records copy intents before publication by resolved absolute
+`OUTPUT/.organize-image.sqlite3` records copy intents before publication by resolved absolute
 source path, SHA-256, destination, category, and staged filesystem identity. Only an
 existing destination with matching identity and contents counts as completed. An
 unchanged source with a verified existing copy
@@ -50,7 +50,10 @@ is reused on subsequent runs. A different source path with identical content is 
 copied into `duplicate-files`. Different content at an existing destination name is
 preserved and a numbered filename is selected. Changed sources or missing/modified
 recorded destinations are processed again using the current SHA-256 database. Renaming
-a source makes it a new source path. Keep the copy records with the output library.
+a source makes it a new source path. Existing source aliases that resolve to one
+directory entry reuse the same verified record; distinct hard-linked filenames remain
+separate sources. If the source has moved, its old record is not adopted by content
+alone. Keep the copy records with the output library.
 
 Summary counts classify processed source files, including reused copies; `ALREADY
 COPIED` messages identify reuse. New hashes are recorded only after successful copying
@@ -59,9 +62,10 @@ COPY` operations, and writes neither database nor reports. Combined similarity m
 uses successful or reused nonduplicate destinations; dry-run uses original paths.
 `--copy --find-similar-only` is rejected because archive-only scanning is read-only.
 
-Run only one organizer against an output library at a time. Copy records and the hash
-database are atomically replaced individually, not as one transaction. After process
-termination, a published copy can be recognized from its intent and the hash database
+Run only one organizer against an output library at a time. SQLite commits each copy
+intent before publication, but a filesystem publication and a database commit cannot
+form one atomic transaction. The database uses SQLite rollback journaling and FULL
+synchronous mode. After process termination, a published copy can be recognized from its intent and the hash database
 repaired on the next non-dry run. Unpublished intents are retried without adopting
 unrelated files. Leftover staging files are excluded from organization and archive
 similarity scans in the corresponding output locations (temporary names use `.copy-`,
@@ -73,7 +77,7 @@ cannot prove provenance. Originals are retained.
 
 ### Output directory
 
-By default, outputs and `.sha256_hashes.txt` stay under `--src`, as before.
+By default, outputs and `.organize-image.sqlite3` stay under `--src`.
 Use `--output PATH` to choose a separate output root:
 
 ```sh
@@ -84,15 +88,39 @@ python organize_images.py --src ./photos --output ./sorted --dry-run
 Organized files go into `OUTPUT/organized-images/`, exact duplicates into
 `OUTPUT/duplicate-files/`, and other files into `OUTPUT/needs-review/`.
 `OUTPUT/similar-images/` is created only when a similarity mode is requested.
-Files are moved using the existing collision-safe transfers; `--output` does
-not enable copying. Relative paths are resolved against the working directory;
-`~`, `..`, and directory aliases are normalized.
+Files are moved using collision-safe transfers; `--output` does not enable copy
+mode. When a move requires copying across filesystems, the copy is staged and
+verified before exclusive publication. If removing the source then fails, the
+complete destination is retained and the error is reported. Interrupted staging
+files are excluded from later scans and are not automatically removed. Relative
+paths are resolved against the working directory; `~`, `..`, and directory aliases
+are normalized.
 
-The hash database lives at `OUTPUT/.sha256_hashes.txt`, so repeat runs and
+Before removing a moved source, the organizer checks that its pathname still
+identifies the published file. Python has no atomic identity-conditional unlink,
+so another process replacing that pathname after the check can still race with
+removal. Run the organizer without concurrent changes to its source or output.
+SQLite database files and sidecars with multiple hard links are rejected before
+writable database access; SQLite's pathname-based opening also has a replacement
+race if another process changes the database entry concurrently. Copy staging
+cleanup checks the temporary file's inode first, but that check and unlink are
+also separate operations.
+
+Move mode commits an intent before each destination publication. After publication,
+it verifies the destination and commits the SHA-256 hash with the completed state.
+On restart, pending destinations are checked by location, filesystem identity, and
+SHA-256 before their hashes affect new sources. If both source and verified
+destination exist, the source is retained for review. Unverified intents remain
+pending; they do not establish duplicate history. Filesystem publication and SQLite
+commits are separate, so this is process-interruption recovery rather than a
+power-loss durability guarantee.
+
+The SQLite database lives at `OUTPUT/.organize-image.sqlite3`, so repeat runs and
 different sources targeting the same output share that library's duplicate
 history. A database at a different source location is left untouched and is
 not automatically migrated or merged. Keep using the same output root to retain
-its history. Similarity-only mode neither reads nor writes either database.
+its history. Similarity-only mode does not open the SQLite database. Existing
+legacy hash and copy-record files are not imported or modified.
 
 Output may equal the source, be outside it, or be nested inside it. A distinct
 output subtree inside the source is excluded entirely from input scanning,
@@ -100,12 +128,14 @@ including pre-existing files there. Normal organization also continues to skip
 the standard generated directory names anywhere in the source. Sources located
 inside one of the configured generated destinations are rejected, as are
 symlinks or files occupying generated directory paths. Choose a different
-output root for those cases. Symbolic-link hash databases are also rejected.
+output root for those cases. Symbolic-link SQLite databases are also rejected.
 Date folders cannot redirect transfers outside their generated directory.
 Invalid paths and startup permission failures are reported without a traceback.
 The run is not transactional: a later transfer or database-save failure does
-not undo earlier successful moves. Dry-run creates no output directories,
-reports, or persistent files.
+not undo earlier successful moves. Dry-run creates no output directories, reports,
+database, or SQLite sidecars. It opens an existing database in immutable read-only
+mode and fails if a journal or WAL is present, because it cannot safely recover or
+read those files without writing.
 
 ### Similarity detection
 
