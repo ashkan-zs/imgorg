@@ -45,12 +45,20 @@ def test_large_identity_recovery_verifies_destination(tmp_path):
 
     def destination_stat(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
-        if os.path.normcase(os.path.abspath(os.fspath(path))) == os.path.normcase(os.path.abspath(destination)):
+        expected = real_stat(destination, follow_symlinks=False)
+        if (result.st_dev, result.st_ino) == (expected.st_dev, expected.st_ino):
             return SimpleNamespace(st_dev=device, st_ino=inode, st_mode=result.st_mode)
         return result
 
     with patch.object(app.os, 'stat', side_effect=destination_stat):
-        assert app.CopyRecords(str(output), store).previous(source, digest) == (str(destination), 'review')
+        previous = app.CopyRecords(str(output), store).previous(source, digest)
+        assert previous is not None
+        previous_path, previous_category = previous
+        assert previous_category == 'review'
+        # The record path is rebuilt with os.path.join while the fixture path
+        # comes from pathlib; Windows may spell equivalent paths differently.
+        # samefile verifies both resolve to the same filesystem entry.
+        assert os.path.samefile(previous_path, destination)
         app.MoveRecords(str(output), store).recover(False)
     assert store.moves()[source][-1] == 'complete'
     assert digest in store.hashes()
