@@ -112,6 +112,20 @@ def test_no_exclusive_publication_fails_safely(tmp_path):
     assert list(existing.parent.iterdir()) == [existing]
 
 
+def test_native_exclusive_rename_preserves_existing_destination(tmp_path):
+    source = add_file(tmp_path / 'staged.jpg')
+    destination = tmp_path / 'published.jpg'
+    organizer.rename_without_overwriting(source, destination)
+    assert destination.read_bytes() == b'photo contents'
+    assert not source.exists()
+
+    second_source = add_file(tmp_path / 'second.jpg', b'second contents')
+    with pytest.raises(FileExistsError):
+        organizer.rename_without_overwriting(second_source, destination)
+    assert second_source.read_bytes() == b'second contents'
+    assert destination.read_bytes() == b'photo contents'
+
+
 @pytest.mark.parametrize('fallback', [False, True])
 def test_source_unlink_failure_keeps_complete_destination(tmp_path, fallback):
     source = add_file(tmp_path / 'source' / 'photo.jpg')

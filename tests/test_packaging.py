@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import os
 from pathlib import Path
 
 
@@ -9,7 +10,8 @@ ROOT = Path(__file__).resolve().parent.parent
 def test_installed_console_script_runs_outside_repository(tmp_path):
     work = tmp_path / "outside"
     work.mkdir()
-    command = Path(sys.executable).parent / "imgorg"
+    executable = "imgorg.exe" if os.name == "nt" else "imgorg"
+    command = Path(sys.executable).parent / executable
     assert command.is_file(), "Install the project before running packaging tests"
     help_result = subprocess.run(
         [str(command), "--help"], cwd=work, capture_output=True, text=True

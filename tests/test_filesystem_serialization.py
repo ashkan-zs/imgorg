@@ -45,7 +45,7 @@ def test_large_identity_recovery_verifies_destination(tmp_path):
 
     def destination_stat(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
-        if os.fspath(path) == str(destination):
+        if os.path.normcase(os.path.abspath(os.fspath(path))) == os.path.normcase(os.path.abspath(destination)):
             return SimpleNamespace(st_dev=device, st_ino=inode, st_mode=result.st_mode)
         return result
 
@@ -83,11 +83,27 @@ def test_legacy_text_keys_integer_identities_are_updated_in_place(tmp_path):
     store.close()
 
 
+def test_unicode_paths_round_trip_through_sqlite(tmp_path):
+    source = str(tmp_path / '写真' / 'café.jpg')
+    destination = 'organized-images/夏.jpg'
+    store = Persistence(str(tmp_path))
+    signature = (11, 22, 33, 44, 55)
+    digest = 'c' * 64
+    store.save_cached_hash(source, signature, digest)
+    store.save_intent(source, digest, destination, 'organized', 11, 22)
+    store.save_move_intent(source, digest, destination, 'organized',
+                           SimpleNamespace(st_dev=11, st_ino=22))
+    assert store.cached_hash(source, signature) == digest
+    assert store.records()[source]['destination'] == destination
+    assert store.moves()[source][1] == destination
+    store.close()
+
+
 def byte_paths(tmp_path):
-    source = tmp_path / os.fsdecode(b'source-\xff')
-    output = tmp_path / os.fsdecode(b'output-\xfe')
-    path = source / os.fsdecode(b'photo-\xfd.jpg')
     try:
+        source = tmp_path / os.fsdecode(b'source-\xff')
+        output = tmp_path / os.fsdecode(b'output-\xfe')
+        path = source / os.fsdecode(b'photo-\xfd.jpg')
         add_file(path, b'contents')
         output.mkdir()
     except (OSError, UnicodeError):
@@ -96,8 +112,12 @@ def byte_paths(tmp_path):
 
 
 def test_surrogateescaped_paths_bind_losslessly_without_filesystem_support(tmp_path):
-    source = str(tmp_path / os.fsdecode(b'source-\xff.jpg'))
-    destination = os.fsdecode(b'needs-review/destination-\xfe.jpg')
+    try:
+        source = os.fsdecode(b'path-\xff')
+        destination = os.fsdecode(b'needs-review/destination-\xfe.jpg')
+    except UnicodeError:
+        pytest.skip('Windows paths use Unicode and do not support POSIX surrogateescape names')
+    source = str(tmp_path / source)
     store = Persistence(str(tmp_path))
     signature = (2**80, 2**90, 1, 2, 3)
     digest = 'a' * 64
