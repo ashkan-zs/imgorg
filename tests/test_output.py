@@ -104,12 +104,29 @@ def test_home_expansion_and_symlink_aliases_use_canonical_paths(tmp_path, monkey
     output = source / 'sorted'
     output.mkdir()
     add_file(output / 'do-not-scan.jpg', b'old output')
-    (tmp_path / 'source-alias').symlink_to(source, target_is_directory=True)
-    (tmp_path / 'output-alias').symlink_to(output, target_is_directory=True)
     monkeypatch.setenv('HOME', str(tmp_path))
+    monkeypatch.setenv('USERPROFILE', str(tmp_path))
+    try:
+        (tmp_path / 'source-alias').symlink_to(source, target_is_directory=True)
+        (tmp_path / 'output-alias').symlink_to(output, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f'Directory symlinks are unavailable: {error}')
     result = run_cli('~/source-alias', '--output', '~/output-alias')
     assert 'Total:        1' in result.stdout
     assert (output / 'do-not-scan.jpg').read_bytes() == b'old output'
+    assert (output / 'organized-images' / DATE_DIRECTORY / 'photo.jpg').is_file()
+
+
+def test_home_expansion_uses_windows_userprofile(tmp_path, monkeypatch):
+    source = tmp_path / 'photos'
+    add_file(source / 'photo.jpg')
+    output = tmp_path / 'sorted'
+    monkeypatch.setenv('HOME', str(tmp_path))
+    if os.name == 'nt':
+        monkeypatch.setenv('HOME', str(tmp_path / 'wrong-home'))
+        monkeypatch.setenv('USERPROFILE', str(tmp_path))
+    result = run_cli('~/photos', '--output', '~/sorted')
+    assert 'Total:        1' in result.stdout
     assert (output / 'organized-images' / DATE_DIRECTORY / 'photo.jpg').is_file()
 
 

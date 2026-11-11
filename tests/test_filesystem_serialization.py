@@ -45,12 +45,20 @@ def test_large_identity_recovery_verifies_destination(tmp_path):
 
     def destination_stat(path, *args, **kwargs):
         result = real_stat(path, *args, **kwargs)
-        if os.fspath(path) == str(destination):
+        expected = real_stat(destination, follow_symlinks=False)
+        if (result.st_dev, result.st_ino) == (expected.st_dev, expected.st_ino):
             return SimpleNamespace(st_dev=device, st_ino=inode, st_mode=result.st_mode)
         return result
 
     with patch.object(app.os, 'stat', side_effect=destination_stat):
-        assert app.CopyRecords(str(output), store).previous(source, digest) == (str(destination), 'review')
+        previous = app.CopyRecords(str(output), store).previous(source, digest)
+        assert previous is not None
+        previous_path, previous_category = previous
+        assert previous_category == 'review'
+        # The record path is rebuilt with os.path.join while the fixture path
+        # comes from pathlib; Windows may spell equivalent paths differently.
+        # samefile verifies both resolve to the same filesystem entry.
+        assert os.path.samefile(previous_path, destination)
         app.MoveRecords(str(output), store).recover(False)
     assert store.moves()[source][-1] == 'complete'
     assert digest in store.hashes()
@@ -83,11 +91,27 @@ def test_legacy_text_keys_integer_identities_are_updated_in_place(tmp_path):
     store.close()
 
 
+def test_unicode_paths_round_trip_through_sqlite(tmp_path):
+    source = str(tmp_path / '写真' / 'café.jpg')
+    destination = 'organized-images/夏.jpg'
+    store = Persistence(str(tmp_path))
+    signature = (11, 22, 33, 44, 55)
+    digest = 'c' * 64
+    store.save_cached_hash(source, signature, digest)
+    store.save_intent(source, digest, destination, 'organized', 11, 22)
+    store.save_move_intent(source, digest, destination, 'organized',
+                           SimpleNamespace(st_dev=11, st_ino=22))
+    assert store.cached_hash(source, signature) == digest
+    assert store.records()[source]['destination'] == destination
+    assert store.moves()[source][1] == destination
+    store.close()
+
+
 def byte_paths(tmp_path):
-    source = tmp_path / os.fsdecode(b'source-\xff')
-    output = tmp_path / os.fsdecode(b'output-\xfe')
-    path = source / os.fsdecode(b'photo-\xfd.jpg')
     try:
+        source = tmp_path / os.fsdecode(b'source-\xff')
+        output = tmp_path / os.fsdecode(b'output-\xfe')
+        path = source / os.fsdecode(b'photo-\xfd.jpg')
         add_file(path, b'contents')
         output.mkdir()
     except (OSError, UnicodeError):
@@ -96,8 +120,12 @@ def byte_paths(tmp_path):
 
 
 def test_surrogateescaped_paths_bind_losslessly_without_filesystem_support(tmp_path):
-    source = str(tmp_path / os.fsdecode(b'source-\xff.jpg'))
-    destination = os.fsdecode(b'needs-review/destination-\xfe.jpg')
+    try:
+        source = os.fsdecode(b'path-\xff')
+        destination = os.fsdecode(b'needs-review/destination-\xfe.jpg')
+    except UnicodeError:
+        pytest.skip('Windows paths use Unicode and do not support POSIX surrogateescape names')
+    source = str(tmp_path / source)
     store = Persistence(str(tmp_path))
     signature = (2**80, 2**90, 1, 2, 3)
     digest = 'a' * 64

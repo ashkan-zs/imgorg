@@ -200,6 +200,15 @@ def move_without_overwriting(source, destination_dir, expected_hash=None, before
 
 def rename_without_overwriting(source, destination):
     """Use a native exclusive rename; never emulate it with check-then-rename."""
+    if sys.platform == 'win32':
+        # MoveFileW is an atomic same-volume rename and fails when the target
+        # already exists. Do not use replacement semantics for publication.
+        function = ctypes.WinDLL('kernel32', use_last_error=True).MoveFileW
+        function.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        function.restype = ctypes.c_int
+        if not function(os.fspath(source), os.fspath(destination)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
     library = ctypes.CDLL(None, use_errno=True)
     if sys.platform == 'darwin' and hasattr(library, 'renamex_np'):
         function = library.renamex_np
