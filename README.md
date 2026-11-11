@@ -3,32 +3,48 @@
 Organize images by date, detect exact duplicates, and optionally report visually
 similar images for human review.
 
-Create and activate a virtual environment, then install the dependencies:
+Install the project from its local repository with pip:
 
 ```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
+python -m pip install .
 ```
 
-Install all requirements, including Pillow, `pillow-heif`, and `ImageHash`.
-ImageHash installs its numerical dependencies automatically.
+For development, use an editable install so changes in the checkout are used
+immediately:
+
+```sh
+python -m pip install -e .
+```
+
+Both commands install the runtime requirements, including Pillow,
+`pillow-heif`, and `ImageHash`. ImageHash installs its numerical dependencies
+automatically. The project is not currently published on PyPI.
+
+Run the installed command:
+
+```sh
+imgorg --src /path/to/photos
+imgorg --src ~/Pictures --copy --dry-run
+```
+
+Direct execution remains available for compatibility:
+`python organize_images.py --src /path/to/photos`.
 JPEG, TIFF, and HEIC/HEIF
 photos use EXIF `DateTimeOriginal` when available; otherwise, the script uses
 the filesystem modification time.
 
-Run the script with `python organize_images.py --src /path/to/photos`.
-Add `--dry-run` to preview changes.
+Add `--dry-run` to preview changes without writing output files, reports, or
+database files.
 
 ### Copy mode
 
 Files are moved by default. Use `--copy` to preserve originals:
 
 ```sh
-python organize_images.py --src ./photos --copy
-python organize_images.py --src ./photos --output ./sorted --copy
-python organize_images.py --src ./photos --output ./sorted --copy --find-similar
-python organize_images.py --src ./photos --output ./sorted --copy --find-similar --dry-run
+imgorg --src ./photos --copy
+imgorg --src ./photos --output ./sorted --copy
+imgorg --src ./photos --output ./sorted --copy --find-similar
+imgorg --src ./photos --output ./sorted --copy --find-similar --dry-run
 ```
 
 Copy mode uses the same organization layout, SHA-256 classification, and collision
@@ -81,8 +97,8 @@ By default, outputs and `.organize-image.sqlite3` stay under `--src`.
 Use `--output PATH` to choose a separate output root:
 
 ```sh
-python organize_images.py --src ~/Pictures/Unsorted --output ~/Pictures/Sorted
-python organize_images.py --src ./photos --output ./sorted --dry-run
+imgorg --src ~/Pictures/Unsorted --output ~/Pictures/Sorted
+imgorg --src ./photos --output ./sorted --dry-run
 ```
 
 Organized files go into `OUTPUT/organized-images/`, exact duplicates into
@@ -143,17 +159,17 @@ Similarity detection is disabled by default. Organize new photos and then
 analyze the successfully processed images:
 
 ```sh
-python organize_images.py --src ./photos --find-similar
-python organize_images.py --src ./photos --output ./sorted --find-similar
+imgorg --src ./photos --find-similar
+imgorg --src ./photos --output ./sorted --find-similar
 ```
 
 Scan an existing archive recursively without running file organization:
 
 ```sh
-python organize_images.py --src ./organized-images --find-similar-only
-python organize_images.py --src ./organized-images --find-similar-only --similar-threshold 5
-python organize_images.py --src ./organized-images --find-similar-only --dry-run
-python organize_images.py --src ./organized-images --output ./reports --find-similar-only
+imgorg --src ./organized-images --find-similar-only
+imgorg --src ./organized-images --find-similar-only --similar-threshold 5
+imgorg --src ./organized-images --find-similar-only --dry-run
+imgorg --src ./organized-images --output ./reports --find-similar-only
 ```
 
 `--find-similar-only` takes precedence if both similarity flags are provided.
@@ -171,7 +187,7 @@ creates the output path, and previews use the original source paths.
 To preview combined organization and similarity analysis without any writes:
 
 ```sh
-python organize_images.py --src ./photos --find-similar --dry-run
+imgorg --src ./photos --find-similar --dry-run
 ```
 
 Both dry-run modes compute hashes and print groups, reference paths, and distances
